@@ -1,0 +1,139 @@
+# Kubernetes AI/Ops Agent Team - Google Antigravity SDK
+
+This repository implements a **Collaborative Team of Specialized AI Agents** to analyze Kubernetes canary deployments. Built using the **Google Antigravity SDK**, this team evaluates logs, resource utilization, and lifecycle events concurrently, resolving any voting conflicts through an orchestrator-led debate.
+
+---
+
+## Architecture Diagram
+
+The diagram below outlines the relationships between Argo Rollouts, the metric plugin, and the distributed agent team:
+
+```mermaid
+graph TB
+    subgraph "Kubernetes Cluster"
+        subgraph "Argo Rollouts System"
+            Argo[Argo Controller] -->|triggers| Plugin[Metric AI Plugin]
+        end
+
+        subgraph "Antigravity Agent Team"
+            Plugin -->|A2A /a2a/analyze| Orchestrator[Lead Orchestrator Service<br/>port 8080]
+            
+            Orchestrator -->|/analyze/logs| LogAgent[Log Analyst Service<br/>port 8080]
+            Orchestrator -->|/analyze/metrics| MetricAgent[Metrics Analyst Service<br/>port 8080]
+            Orchestrator -->|/analyze/events| EventAgent[Event Analyst Service<br/>port 8080]
+        end
+
+        subgraph "Kubernetes Infrastructure"
+            LogAgent -->|fetch logs| K8sAPI[Kubernetes API Server]
+            MetricAgent -->|query metrics| MetricsServer[Metrics Server API]
+            EventAgent -->|list events| K8sAPI
+        end
+    end
+```
+
+---
+
+## Sequence Diagram
+
+The sequence diagram below displays the concurrent scatter-gather execution and debate process:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Plugin as Metric AI Plugin
+    participant Orch as Lead Orchestrator
+    participant Logs as Log Analyst
+    participant Metrics as Metrics Analyst
+    participant Events as Event Analyst
+    participant K8s as Kubernetes API
+
+    Plugin->>Orch: POST /a2a/analyze (selectors & namespace)
+    Note over Orch: Dispatch requests in parallel
+    par Fetch & Analyze logs
+        Orch->>Logs: POST /analyze/logs
+        Logs->>K8s: Get pod logs (fetch_kubernetes_pod_logs)
+        K8s-->>Logs: Log outputs
+        Note over Logs: Analyze regression
+        Logs-->>Orch: Recommendation & Vote
+    and Fetch & Analyze metrics
+        Orch->>Metrics: POST /analyze/metrics
+        Metrics->>K8s: Query custom metrics API (fetch_kubernetes_pod_metrics)
+        K8s-->>Metrics: CPU/Memory utilization
+        Note over Metrics: Check throttling/leaks
+        Metrics-->>Orch: Recommendation & Vote
+    and Fetch & Analyze events
+        Orch->>Events: POST /analyze/events
+        Events->>K8s: List namespace events (fetch_kubernetes_namespace_events)
+        K8s-->>Events: Recent Warnings/Errors
+        Note over Events: Assess lifecycle issues
+        Events-->>Orch: Recommendation & Vote
+    end
+    Note over Orch: Synthesize reports & run Debate Prompt
+    Orch-->>Plugin: Return consensus JSON (promote, confidence, votingRationale)
+```
+
+---
+
+## Agent Roles & SDK Configuration
+
+The agent microservices run a single unified Docker container image, configured via CLI parameters at startup:
+
+1. **Lead Orchestrator (`--role orchestrator`)**
+   * Configured via [orchestrator.py](file:///Users/sanchezg/dev/carlossg/argo-rollouts/rollouts-plugin-metric-ai/kubernetes-agents-antigravity/agents/orchestrator.py).
+   * Orchestrates the specialist subagents. If the specialists return conflicting recommendations, it prompts Gemini to debate the reports and yield a final unified JSON consensus block.
+2. **Log Analyst (`--role logs`)**
+   * Configured via [logs.py](file:///Users/sanchezg/dev/carlossg/argo-rollouts/rollouts-plugin-metric-ai/kubernetes-agents-antigravity/agents/logs.py).
+   * Runs the `LogAnalystAgent` which calls `fetch_kubernetes_pod_logs` to analyze application log differences between stable and canary versions.
+3. **Metrics Analyst (`--role metrics`)**
+   * Configured via [metrics.py](file:///Users/sanchezg/dev/carlossg/argo-rollouts/rollouts-plugin-metric-ai/kubernetes-agents-antigravity/agents/metrics.py).
+   * Runs the `MetricsAnalystAgent` which calls `fetch_kubernetes_pod_metrics` to verify that CPU or memory consumption has not experienced spikes or leaks.
+4. **Event Analyst (`--role events`)**
+   * Configured via [events.py](file:///Users/sanchezg/dev/carlossg/argo-rollouts/rollouts-plugin-metric-ai/kubernetes-agents-antigravity/agents/events.py).
+   * Runs the `EventAnalystAgent` which calls `fetch_kubernetes_namespace_events` to monitor warning event streams for crash loops or probe failures.
+
+---
+
+## Getting Started
+
+### Prerequisites
+* Python 3.11+
+* Docker
+* Kubernetes cluster (e.g. Kind)
+
+### 1. Build the Docker Image
+Build the multi-role container image locally:
+```bash
+docker build -t kubernetes-agents-antigravity:latest .
+```
+
+### 2. Deploy to Kubernetes
+Apply the ServiceAccount, RBAC rules, Services, and Deployments to your cluster:
+```bash
+kubectl apply -f k8s/agents.yaml
+```
+
+The manifests are located in [agents.yaml](file:///Users/sanchezg/dev/carlossg/argo-rollouts/rollouts-plugin-metric-ai/kubernetes-agents-antigravity/k8s/agents.yaml).
+
+### 3. Verification & Testing
+To test the analysis loop independently, run the following test curl script inside the orchestrator container:
+```bash
+kubectl exec -n argo-rollouts deployment/kubernetes-agent-orchestrator -- python3 -c "
+import urllib.request, json
+req_data = {
+  'userId': 'argo-rollouts',
+  'prompt': 'Analyze canary deployment for rollout canary-demo.',
+  'context': {
+    'namespace': 'rollouts-test-system',
+    'rolloutName': 'canary-demo',
+    'stableSelector': 'role=stable',
+    'canarySelector': 'role=canary'
+  }
+}
+req = urllib.request.Request(
+    'http://localhost:8080/a2a/analyze',
+    data=json.dumps(req_data).encode(),
+    headers={'Content-Type': 'application/json'}
+)
+print(urllib.request.urlopen(req).read().decode())
+"
+```

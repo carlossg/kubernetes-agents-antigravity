@@ -1,0 +1,216 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubernetes-agents-sa
+  namespace: argo-rollouts
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubernetes-agents-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events"]
+    verbs: ["get", "list"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubernetes-agents-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubernetes-agents-role
+subjects:
+  - kind: ServiceAccount
+    name: kubernetes-agents-sa
+    namespace: argo-rollouts
+---
+# -----------------------------------------------------------------------------
+# Log Analyst Service & Deployment
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubernetes-agent-logs
+  namespace: argo-rollouts
+spec:
+  ports:
+    - port: 8080
+      targetPort: 8080
+  selector:
+    app: kubernetes-agent-logs
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubernetes-agent-logs
+  namespace: argo-rollouts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubernetes-agent-logs
+  template:
+    metadata:
+      labels:
+        app: kubernetes-agent-logs
+    spec:
+      serviceAccountName: kubernetes-agents-sa
+      containers:
+        - name: agent
+          image: kubernetes-agents-antigravity:latest
+          imagePullPolicy: IfNotPresent
+          args: ["--role", "logs"]
+          env:
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: argo-rollouts-secret
+                  key: GEMINI_API_KEY
+          ports:
+            - containerPort: 8080
+---
+# -----------------------------------------------------------------------------
+# Metrics Analyst Service & Deployment
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubernetes-agent-metrics
+  namespace: argo-rollouts
+spec:
+  ports:
+    - port: 8080
+      targetPort: 8080
+  selector:
+    app: kubernetes-agent-metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubernetes-agent-metrics
+  namespace: argo-rollouts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubernetes-agent-metrics
+  template:
+    metadata:
+      labels:
+        app: kubernetes-agent-metrics
+    spec:
+      serviceAccountName: kubernetes-agents-sa
+      containers:
+        - name: agent
+          image: kubernetes-agents-antigravity:latest
+          imagePullPolicy: IfNotPresent
+          args: ["--role", "metrics"]
+          env:
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: argo-rollouts-secret
+                  key: GEMINI_API_KEY
+          ports:
+            - containerPort: 8080
+---
+# -----------------------------------------------------------------------------
+# Event Analyst Service & Deployment
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubernetes-agent-events
+  namespace: argo-rollouts
+spec:
+  ports:
+    - port: 8080
+      targetPort: 8080
+  selector:
+    app: kubernetes-agent-events
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubernetes-agent-events
+  namespace: argo-rollouts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubernetes-agent-events
+  template:
+    metadata:
+      labels:
+        app: kubernetes-agent-events
+    spec:
+      serviceAccountName: kubernetes-agents-sa
+      containers:
+        - name: agent
+          image: kubernetes-agents-antigravity:latest
+          imagePullPolicy: IfNotPresent
+          args: ["--role", "events"]
+          env:
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: argo-rollouts-secret
+                  key: GEMINI_API_KEY
+          ports:
+            - containerPort: 8080
+---
+# -----------------------------------------------------------------------------
+# Lead Orchestrator Service & Deployment (Exposed gateway)
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubernetes-agent-orchestrator
+  namespace: argo-rollouts
+spec:
+  ports:
+    - port: 8080
+      targetPort: 8080
+  selector:
+    app: kubernetes-agent-orchestrator
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubernetes-agent-orchestrator
+  namespace: argo-rollouts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubernetes-agent-orchestrator
+  template:
+    metadata:
+      labels:
+        app: kubernetes-agent-orchestrator
+    spec:
+      serviceAccountName: kubernetes-agents-sa
+      containers:
+        - name: agent
+          image: kubernetes-agents-antigravity:latest
+          imagePullPolicy: IfNotPresent
+          args: ["--role", "orchestrator"]
+          env:
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: argo-rollouts-secret
+                  key: GEMINI_API_KEY
+            - name: LOGS_AGENT_URL
+              value: "http://kubernetes-agent-logs.argo-rollouts.svc.cluster.local:8080"
+            - name: METRICS_AGENT_URL
+              value: "http://kubernetes-agent-metrics.argo-rollouts.svc.cluster.local:8080"
+            - name: EVENTS_AGENT_URL
+              value: "http://kubernetes-agent-events.argo-rollouts.svc.cluster.local:8080"
+          ports:
+            - containerPort: 8080
