@@ -1,0 +1,25 @@
+apiVersion: agents.x-k8s.io/v1beta1
+kind: Sandbox
+metadata:
+  name: kubernetes-agent-logs
+  namespace: argo-rollouts
+spec:
+  podTemplate:
+    metadata:
+      labels:
+        app: kubernetes-agent-logs
+    spec:
+      serviceAccountName: kubernetes-agents-sa
+      containers:
+        - name: agent
+          image: kubernetes-agents-antigravity:latest
+          imagePullPolicy: IfNotPresent
+          args: ["--role", "logs"]
+          env:
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: argo-rollouts-secret
+                  key: GEMINI_API_KEY
+          ports:
+            - containerPort: 8080

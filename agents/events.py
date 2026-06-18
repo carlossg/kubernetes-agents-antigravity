@@ -47,7 +47,9 @@ class EventAnalystAgent:
             system_instructions=(
                 "You are a Kubernetes Event Analyst Agent. Your specialty is examining warning events, crash loops, "
                 "readiness probe failures, or OOM restarts in the namespace. "
-                "You are provided with a tool 'fetch_kubernetes_namespace_events' to inspect recent namespace events. "
+                "You are running inside a Kubernetes Pod with in-cluster service account authentication. "
+                "Do NOT attempt to read kubeconfig files like '/root/.kube/config' or run local commands. "
+                "Use ONLY the provided tool 'fetch_kubernetes_namespace_events' to inspect recent namespace events. "
                 "Identify any events relating to the stable/canary pods. "
                 "Determine if there are infrastructure or lifecycle warnings that should block the promotion."
             ),

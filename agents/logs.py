@@ -38,7 +38,9 @@ class LogAnalystAgent:
         self.config = LocalAgentConfig(
             system_instructions=(
                 "You are a Kubernetes Log Analyst Agent. Your specialty is analyzing application logs for regressions. "
-                "You are provided with a tool 'fetch_kubernetes_pod_logs' to fetch pod logs. "
+                "You are running inside a Kubernetes Pod with in-cluster service account authentication. "
+                "Do NOT attempt to read kubeconfig files like '/root/.kube/config' or run local commands. "
+                "Use ONLY the provided tool 'fetch_kubernetes_pod_logs' to retrieve logs. "
                 "Compare the logs of stable pods vs canary pods. Look for exceptions, error rates, and regressions. "
                 "Determine if the canary pod logs indicate a healthy application that can be promoted, "
                 "or if there are new failures, and output your recommendation."
