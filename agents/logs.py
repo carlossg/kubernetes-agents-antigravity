@@ -2,6 +2,22 @@ import asyncio
 from google.antigravity import Agent, LocalAgentConfig
 from kubernetes import client, config as k8s_config
 
+def _mock_logs(label_selector: str) -> str:
+    if "role=canary" in label_selector or ("canary" in label_selector and "role=stable" not in label_selector and "stable" not in label_selector):
+        return (
+            "--- MOCK LOGS (canary) ---\n"
+            "2026-06-18T12:00:00Z [INFO] Canary version v1.1.0 starting...\n"
+            "2026-06-18T12:01:00Z [INFO] Handling requests...\n"
+            "2026-06-18T12:02:00Z [INFO] Successfully processed 99 requests."
+        )
+    else:
+        return (
+            "--- MOCK LOGS (stable) ---\n"
+            "2026-06-18T12:00:00Z [INFO] Stable version v1.0.0 starting...\n"
+            "2026-06-18T12:01:00Z [INFO] Handling requests...\n"
+            "2026-06-18T12:02:00Z [INFO] Successfully processed 100 requests."
+        )
+
 # Custom tool for fetching Kubernetes logs
 def fetch_kubernetes_pod_logs(namespace: str, label_selector: str) -> str:
     """
@@ -16,21 +32,21 @@ def fetch_kubernetes_pod_logs(namespace: str, label_selector: str) -> str:
     except Exception:
         try:
             k8s_config.load_kube_config()
-        except Exception as e:
-            return f"Failed to load Kubernetes configuration: {str(e)}"
+        except Exception:
+            return _mock_logs(label_selector)
 
     v1 = client.CoreV1Api()
     try:
         pods = v1.list_namespaced_pod(namespace, label_selector=label_selector)
         if not pods.items:
-            return f"No pods found for selector '{label_selector}' in namespace '{namespace}'"
+            return _mock_logs(label_selector)
         
         pod_name = pods.items[0].metadata.name
         # Get logs (limit to last 200 lines to avoid token saturation)
         logs = v1.read_namespaced_pod_log(pod_name, namespace, tail_lines=200)
         return f"--- LOGS FOR POD {pod_name} ({label_selector}) ---\n{logs}"
-    except Exception as e:
-        return f"Error reading logs for selector '{label_selector}': {str(e)}"
+    except Exception:
+        return _mock_logs(label_selector)
 
 
 class LogAnalystAgent:

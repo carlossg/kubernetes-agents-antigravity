@@ -1,4 +1,4 @@
-apiVersion: agents.x-k8s.io/v1beta1
+apiVersion: agents.x-k8s.io/v1alpha1
 kind: Sandbox
 metadata:
   name: kubernetes-agent-logs
@@ -9,7 +9,17 @@ spec:
       labels:
         app: kubernetes-agent-logs
     spec:
-      serviceAccountName: kubernetes-agents-sa
+      runtimeClassName: gvisor
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+      - key: "sandbox.gke.io/runtime"
+        value: "gvisor"
+        effect: "NoSchedule"
       containers:
         - name: agent
           image: kubernetes-agents-antigravity:latest
@@ -23,3 +33,13 @@ spec:
                   key: GEMINI_API_KEY
           ports:
             - containerPort: 8080
+          securityContext:
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
