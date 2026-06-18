@@ -6,6 +6,12 @@
 
 set -euo pipefail
 
+# Auto-detect Colima docker socket if running on macOS
+if [ -S "${HOME}/.colima/default/docker.sock" ]; then
+    export DOCKER_HOST="unix://${HOME}/.colima/default/docker.sock"
+    echo "✓ Detected Colima Docker socket. Configured DOCKER_HOST."
+fi
+
 PROJECT_ID=$(gcloud config get-value project 2>/dev/null || true)
 if [ -z "${PROJECT_ID}" ]; then
     echo "❌ Error: No default Google Cloud project set."
