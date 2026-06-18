@@ -35,7 +35,7 @@ fi
 
 # 2. Build Docker Image
 echo "📦 Building docker image..."
-docker build -t "${IMAGE_URL}" .
+docker build --platform linux/amd64 -t "${IMAGE_URL}" .
 
 # 3. Configure Docker credential helper & Push
 echo "🔑 Logging into Google Artifact Registry..."
