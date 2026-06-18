@@ -1,16 +1,29 @@
 #!/usr/bin/env bash
 
 # ==============================================================================
-# Deploy and Test Agent Team on GKE Autopilot with Agent Sandbox (using GHCR)
+# Build, Deploy, and Test Agent Team on GKE Autopilot with Agent Sandbox (using GAR)
 # ==============================================================================
 
 set -euo pipefail
 
-IMAGE_URL="ghcr.io/carlossg/kubernetes-agents-antigravity:latest"
+# Auto-detect Colima docker socket if running on macOS
+if [ -S "${HOME}/.colima/default/docker.sock" ]; then
+    export DOCKER_HOST="unix://${HOME}/.colima/default/docker.sock"
+    echo "✓ Detected Colima Docker socket. Configured DOCKER_HOST."
+fi
+
+PROJECT_ID=$(gcloud config get-value project 2>/dev/null || true)
+if [ -z "${PROJECT_ID}" ]; then
+    echo "❌ Error: No default Google Cloud project set."
+    exit 1
+fi
+
+REGISTRY="us-central1-docker.pkg.dev"
+IMAGE_URL="${REGISTRY}/${PROJECT_ID}/github/kubernetes-agents-antigravity:latest"
 
 echo "====================================================================="
 echo " Deploying Agent Team to GKE Cluster"
-echo " Image source: ${IMAGE_URL}"
+echo " Image target: ${IMAGE_URL}"
 echo "====================================================================="
 
 # 1. Check GEMINI_API_KEY
@@ -20,7 +33,18 @@ if [ -z "${GEMINI_API_KEY:-}" ]; then
     exit 1
 fi
 
-# 2. Prepare Namespace & Secret
+# 2. Build Docker Image
+echo "📦 Building docker image..."
+docker build -t "${IMAGE_URL}" .
+
+# 3. Configure Docker credential helper & Push
+echo "🔑 Logging into Google Artifact Registry..."
+gcloud auth configure-docker "${REGISTRY}" --quiet
+
+echo "🚀 Pushing docker image..."
+docker push "${IMAGE_URL}"
+
+# 4. Prepare Namespace & Secret
 echo "⚙️ Creating namespace 'argo-rollouts'..."
 kubectl create namespace argo-rollouts --dry-run=client -o yaml | kubectl apply -f -
 
@@ -30,12 +54,12 @@ kubectl create secret generic argo-rollouts-secret \
     --from-literal=GEMINI_API_KEY="${GEMINI_API_KEY}" \
     --dry-run=client -o yaml | kubectl apply -f -
 
-# 3. Deploy manifests using the GHCR image
+# 5. Deploy manifests using the GCR registry image
 echo "📄 Deploying agent workloads..."
 cat k8s/agents.yaml | sed "s|kubernetes-agents-antigravity:latest|${IMAGE_URL}|g" | kubectl apply -f -
 cat k8s/log-analyst-sandbox.yaml | sed "s|kubernetes-agents-antigravity:latest|${IMAGE_URL}|g" | kubectl apply -f -
 
-# 4. Wait for deployments
+# 6. Wait for deployments
 echo "⏳ Waiting for specialist deployments to be ready..."
 kubectl rollout status deployment/kubernetes-agent-orchestrator -n argo-rollouts --timeout=3m
 kubectl rollout status deployment/kubernetes-agent-metrics -n argo-rollouts --timeout=3m
@@ -46,7 +70,7 @@ echo "⏳ Waiting for log analyst sandbox to be ready..."
 sleep 15
 kubectl wait --for=condition=Ready pod -l app=kubernetes-agent-logs -n argo-rollouts --timeout=5m
 
-# 5. Run Test Analysis Execution
+# 7. Run Test Analysis Execution
 echo "🧪 Running end-to-end orchestration analysis test..."
 kubectl exec -n argo-rollouts deployment/kubernetes-agent-orchestrator -- python3 -c "
 import urllib.request, json
