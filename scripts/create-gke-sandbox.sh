@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Configurable defaults (can be overridden by environment variables)
-CLUSTER_NAME="${CLUSTER_NAME:-agent-sandbox-cluster}"
+CLUSTER_NAME="${CLUSTER_NAME:-autopilot-cluster-1}"
 LOCATION="${LOCATION:-us-central1}"
 CLUSTER_VERSION="${CLUSTER_VERSION:-latest}"
 
