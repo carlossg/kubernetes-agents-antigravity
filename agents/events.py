@@ -1,13 +1,7 @@
+import os
 import asyncio
 from google.antigravity import Agent, LocalAgentConfig
 from kubernetes import client, config as k8s_config
-
-def _mock_events() -> str:
-    return (
-        "--- RECENT NAMESPACE EVENTS ---\n"
-        "[Normal] Object: Pod/stable-pod-456, Reason: Started, Message: Started container agent (Count: 1)\n"
-        "[Normal] Object: Pod/canary-pod-123, Reason: Started, Message: Started container agent (Count: 1)"
-    )
 
 # Custom tool for listing Kubernetes events
 def fetch_kubernetes_namespace_events(namespace: str) -> str:
@@ -22,14 +16,14 @@ def fetch_kubernetes_namespace_events(namespace: str) -> str:
     except Exception:
         try:
             k8s_config.load_kube_config()
-        except Exception:
-            return _mock_events()
+        except Exception as e:
+            return f"Failed to load kubernetes configuration: {str(e)}"
 
     v1 = client.CoreV1Api()
     try:
         events = v1.list_namespaced_event(namespace, limit=30)
         if not events.items:
-            return _mock_events()
+            return f"No events found in namespace '{namespace}'"
         
         event_lines = []
         for e in events.items:
@@ -44,12 +38,14 @@ def fetch_kubernetes_namespace_events(namespace: str) -> str:
             )
         
         return "--- RECENT NAMESPACE EVENTS ---\n" + "\n".join(event_lines)
-    except Exception:
-        return _mock_events()
+    except Exception as e:
+        return f"Failed to fetch events: {str(e)}"
 
 
 class EventAnalystAgent:
-    def __init__(self):
+    def __init__(self, model: str | None = None):
+        # Allow override via environment variable if not passed directly
+        effective_model = model or os.getenv("EVENTS_AGENT_MODEL")
         self.config = LocalAgentConfig(
             system_instructions=(
                 "You are a Kubernetes Event Analyst Agent. Your specialty is examining warning events, crash loops, "
@@ -60,7 +56,8 @@ class EventAnalystAgent:
                 "Identify any events relating to the stable/canary pods. "
                 "Determine if there are infrastructure or lifecycle warnings that should block the promotion."
             ),
-            tools=[fetch_kubernetes_namespace_events]
+            tools=[fetch_kubernetes_namespace_events],
+            model=effective_model
         )
 
     async def analyze(self, namespace: str, stable_selector: str, canary_selector: str, extra_prompt: str = "") -> str:
@@ -74,3 +71,4 @@ class EventAnalystAgent:
         async with Agent(self.config) as agent:
             response = await agent.chat(prompt)
             return await response.text()
+

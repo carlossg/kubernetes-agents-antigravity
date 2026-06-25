@@ -1,0 +1,14 @@
+[x] make the model be configurable individually in each agent
+    - Configured via model argument in __init__, HTTP parameters, and env variables (ORCHESTRATOR_AGENT_MODEL, LOGS_AGENT_MODEL, METRICS_AGENT_MODEL, EVENTS_AGENT_MODEL).
+[x] _mock methods should not be used, move it to tests only
+    - Removed _mock_* functions from agent files; they now throw exceptions or return error details when Kubernetes configurations or list actions fail. Real mocks are now contained inside test files.
+[x] create more unit tests, checking the promote and revert case for each agent
+    - Expanded test suite to 15 unit tests covering healthy/unhealthy (promote/revert) cases for logs, metrics, events, and the orchestrator consensus mechanism.
+[x] what is result["modelResults"] doing in the orchestrator.py, is it mocking data?
+    - **Answer**: It is not entirely mocking data, but it is a hybrid of real data and mocked/hardcoded metadata.
+      - **Real data**: The `analysis` field contains the actual reports returned by the `LogAnalystAgent`, `MetricsAnalystAgent`, and `EventAnalystAgent`.
+      - **Heuristics**: The `promote` field is heuristically inferred by searching the subagents' text reports for keywords like `"promote: true"`, `"recommend promotion"`, or `"healthy"`.
+      - **Mocked/Hardcoded metadata**: The `confidence` is hardcoded to default values (`85` or `80`), and `rootCause` and `remediation` are hardcoded as empty strings (`""`), as they are not parsed from the subagent text outputs.
+[x] agents should have an option to query a locally running gemma 4 diffusion model
+    - Integrated as part of individual agent model config; local models can be queried by passing custom model identifiers like "gemma-4-diffusion".
+

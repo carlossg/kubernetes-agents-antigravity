@@ -7,7 +7,9 @@ from agents.metrics import MetricsAnalystAgent
 from agents.events import EventAnalystAgent
 
 class LeadOrchestratorAgent:
-    def __init__(self):
+    def __init__(self, model: str | None = None, log_model: str | None = None, metrics_model: str | None = None, event_model: str | None = None):
+        import os
+        effective_model = model or os.getenv("ORCHESTRATOR_AGENT_MODEL")
         self.config = LocalAgentConfig(
             system_instructions=(
                 "You are the Lead Orchestrator and Consensus Resolver Agent. "
@@ -24,8 +26,12 @@ class LeadOrchestratorAgent:
                 '  "votingRationale": "summary of the team debate and how you resolved conflicts"\n'
                 "}\n"
                 "Ensure your response is valid JSON that can be parsed directly by json.loads()."
-            )
+            ),
+            model=effective_model
         )
+        self.log_model = log_model or os.getenv("LOGS_AGENT_MODEL")
+        self.metrics_model = metrics_model or os.getenv("METRICS_AGENT_MODEL")
+        self.event_model = event_model or os.getenv("EVENTS_AGENT_MODEL")
 
     async def analyze_rollout(
         self, 
@@ -47,52 +53,62 @@ class LeadOrchestratorAgent:
             if logs_url:
                 try:
                     async with httpx.AsyncClient(timeout=300.0) as client:
-                        resp = await client.post(f"{logs_url}/analyze/logs", json={
+                        payload = {
                             "namespace": namespace,
                             "stableSelector": stable_selector,
                             "canarySelector": canary_selector,
                             "extraPrompt": extra_prompt
-                        })
+                        }
+                        if self.log_model:
+                            payload["model"] = self.log_model
+                        resp = await client.post(f"{logs_url}/analyze/logs", json=payload)
                         return resp.json()["analysis"]
                 except Exception as e:
                     return f"Failed to call remote LogAnalystAgent: {str(e)}"
             else:
-                logs_agent = LogAnalystAgent()
+                logs_agent = LogAnalystAgent(model=self.log_model)
                 return await logs_agent.analyze(namespace, stable_selector, canary_selector, extra_prompt)
 
         async def run_metrics():
             if metrics_url:
                 try:
                     async with httpx.AsyncClient(timeout=300.0) as client:
-                        resp = await client.post(f"{metrics_url}/analyze/metrics", json={
+                        payload = {
                             "namespace": namespace,
                             "stableSelector": stable_selector,
                             "canarySelector": canary_selector,
                             "extraPrompt": extra_prompt
-                        })
+                        }
+                        if self.metrics_model:
+                            payload["model"] = self.metrics_model
+                        resp = await client.post(f"{metrics_url}/analyze/metrics", json=payload)
                         return resp.json()["analysis"]
                 except Exception as e:
                     return f"Failed to call remote MetricsAnalystAgent: {str(e)}"
             else:
-                metrics_agent = MetricsAnalystAgent()
+                metrics_agent = MetricsAnalystAgent(model=self.metrics_model)
                 return await metrics_agent.analyze(namespace, stable_selector, canary_selector, extra_prompt)
 
         async def run_events():
             if events_url:
                 try:
                     async with httpx.AsyncClient(timeout=300.0) as client:
-                        resp = await client.post(f"{events_url}/analyze/events", json={
+                        payload = {
                             "namespace": namespace,
                             "stableSelector": stable_selector,
                             "canarySelector": canary_selector,
                             "extraPrompt": extra_prompt
-                        })
+                        }
+                        if self.event_model:
+                            payload["model"] = self.event_model
+                        resp = await client.post(f"{events_url}/analyze/events", json=payload)
                         return resp.json()["analysis"]
                 except Exception as e:
                     return f"Failed to call remote EventAnalystAgent: {str(e)}"
             else:
-                events_agent = EventAnalystAgent()
+                events_agent = EventAnalystAgent(model=self.event_model)
                 return await events_agent.analyze(namespace, stable_selector, canary_selector, extra_prompt)
+
 
         # Execute specialized analyses concurrently
         print(f"[Orchestrator] Starting concurrent subagent evaluations for rollout '{rollout_name}'...")

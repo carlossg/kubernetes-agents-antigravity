@@ -34,6 +34,7 @@ class SpecialistRequest(BaseModel):
     stableSelector: str
     canarySelector: str
     extraPrompt: Optional[str] = ""
+    model: Optional[str] = None
 
 @app.get("/")
 def health_check():
@@ -55,6 +56,12 @@ if args.role == "orchestrator":
         canary_selector = ctx.get("canarySelector")
         extra_prompt = ctx.get("extraPrompt", "")
 
+        # Extract optional model configurations from the request context
+        model = ctx.get("model")
+        log_model = ctx.get("logModel")
+        metrics_model = ctx.get("metricsModel")
+        event_model = ctx.get("eventModel")
+
         if not namespace or not rollout_name or not stable_selector or not canary_selector:
             raise HTTPException(
                 status_code=400,
@@ -62,7 +69,12 @@ if args.role == "orchestrator":
             )
 
         try:
-            orchestrator = LeadOrchestratorAgent()
+            orchestrator = LeadOrchestratorAgent(
+                model=model,
+                log_model=log_model,
+                metrics_model=metrics_model,
+                event_model=event_model
+            )
             result = await orchestrator.analyze_rollout(
                 namespace=namespace,
                 rollout_name=rollout_name,
@@ -79,7 +91,7 @@ elif args.role == "logs":
     async def analyze_logs(request: SpecialistRequest):
         """Analyze logs and return a text report."""
         try:
-            agent = LogAnalystAgent()
+            agent = LogAnalystAgent(model=request.model)
             report = await agent.analyze(
                 namespace=request.namespace,
                 stable_selector=request.stableSelector,
@@ -95,7 +107,7 @@ elif args.role == "metrics":
     async def analyze_metrics(request: SpecialistRequest):
         """Analyze pod resource metrics and return a text report."""
         try:
-            agent = MetricsAnalystAgent()
+            agent = MetricsAnalystAgent(model=request.model)
             report = await agent.analyze(
                 namespace=request.namespace,
                 stable_selector=request.stableSelector,
@@ -111,7 +123,7 @@ elif args.role == "events":
     async def analyze_events(request: SpecialistRequest):
         """Analyze namespace events and return a text report."""
         try:
-            agent = EventAnalystAgent()
+            agent = EventAnalystAgent(model=request.model)
             report = await agent.analyze(
                 namespace=request.namespace,
                 stable_selector=request.stableSelector,

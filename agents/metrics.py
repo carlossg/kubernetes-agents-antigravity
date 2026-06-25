@@ -1,18 +1,7 @@
+import os
 import asyncio
 from google.antigravity import Agent, LocalAgentConfig
 from kubernetes import client, config as k8s_config
-
-def _mock_metrics(label_selector: str) -> str:
-    if "role=canary" in label_selector or ("canary" in label_selector and "role=stable" not in label_selector and "stable" not in label_selector):
-        return (
-            "--- RESOURCE UTILIZATION METRICS (canary) ---\n"
-            "Pod: canary-pod-123, Container: agent -> CPU usage: 15m, Memory usage: 120Mi"
-        )
-    else:
-        return (
-            "--- RESOURCE UTILIZATION METRICS (stable) ---\n"
-            "Pod: stable-pod-456, Container: agent -> CPU usage: 12m, Memory usage: 110Mi"
-        )
 
 # Custom tool for fetching resource metrics
 def fetch_kubernetes_pod_metrics(namespace: str, label_selector: str) -> str:
@@ -27,9 +16,25 @@ def fetch_kubernetes_pod_metrics(namespace: str, label_selector: str) -> str:
         k8s_config.load_incluster_config()
     except Exception:
         try:
-            k8s_config.load_kube_config()
-        except Exception:
-            return _mock_metrics(label_selector)
+            # Let's inspect contexts in kubeconfig first
+            import yaml
+            kubeconfig_path = os.path.expanduser("~/.kube/config")
+            if os.path.exists(kubeconfig_path):
+                with open(kubeconfig_path, "r") as f:
+                    config_data = yaml.safe_load(f)
+                contexts = config_data.get("contexts", [])
+                context_names = [c.get("name") for c in contexts if c.get("name")]
+                current_context = config_data.get("current-context")
+                
+                # If current-context is empty or invalid, try using the first valid context
+                if not current_context and context_names:
+                    k8s_config.load_kube_config(context=context_names[0])
+                else:
+                    k8s_config.load_kube_config()
+            else:
+                k8s_config.load_kube_config()
+        except Exception as e:
+            return f"Failed to load kubernetes configuration. Error: {str(e)}. Path exists: {os.path.exists(kubeconfig_path)}"
 
     custom_api = client.CustomObjectsApi()
     try:
@@ -45,7 +50,7 @@ def fetch_kubernetes_pod_metrics(namespace: str, label_selector: str) -> str:
         
         items = response.get("items", [])
         if not items:
-            return _mock_metrics(label_selector)
+            return f"No metrics found in namespace '{namespace}' matching selector '{label_selector}'"
         
         metrics_summary = []
         for item in items:
@@ -58,12 +63,14 @@ def fetch_kubernetes_pod_metrics(namespace: str, label_selector: str) -> str:
                 metrics_summary.append(f"Pod: {pod_name}, Container: {c_name} -> CPU usage: {cpu}, Memory usage: {mem}")
         
         return "--- RESOURCE UTILIZATION METRICS ---\n" + "\n".join(metrics_summary)
-    except Exception:
-        return _mock_metrics(label_selector)
+    except Exception as e:
+        return f"Failed to fetch metrics: {str(e)}"
 
 
 class MetricsAnalystAgent:
-    def __init__(self):
+    def __init__(self, model: str | None = None):
+        # Allow override via environment variable if not passed directly
+        effective_model = model or os.getenv("METRICS_AGENT_MODEL")
         self.config = LocalAgentConfig(
             system_instructions=(
                 "You are a Kubernetes Metrics Analyst Agent. Your specialty is analyzing resource usage trends (CPU and Memory). "
@@ -73,7 +80,8 @@ class MetricsAnalystAgent:
                 "Compare the resource consumption of stable pods vs canary pods. Look for memory leaks, CPU spikes, or throttling. "
                 "Determine if the metrics indicate a stable deployment that is safe to promote, or a regression, and provide your vote."
             ),
-            tools=[fetch_kubernetes_pod_metrics]
+            tools=[fetch_kubernetes_pod_metrics],
+            model=effective_model
         )
 
     async def analyze(self, namespace: str, stable_selector: str, canary_selector: str, extra_prompt: str = "") -> str:
@@ -87,3 +95,4 @@ class MetricsAnalystAgent:
         async with Agent(self.config) as agent:
             response = await agent.chat(prompt)
             return await response.text()
+
