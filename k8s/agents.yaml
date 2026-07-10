@@ -87,6 +87,13 @@ spec:
           args: ["--role", "log-proxy"]
           ports:
             - containerPort: 8080
+          resources:
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
 ---
 # -----------------------------------------------------------------------------
 # Metrics Analyst Service & Deployment

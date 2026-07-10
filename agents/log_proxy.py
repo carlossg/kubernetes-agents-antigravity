@@ -1,5 +1,18 @@
 from kubernetes import client, config as k8s_config
 
+# Namespaces the log-proxy will never read from, even though its service
+# account has cluster-wide pod/log read access.
+FORBIDDEN_NAMESPACES = {"kube-system", "kube-public", "kube-node-lease", "argo-rollouts"}
+
+_config_loaded = False
+
+
+def _ensure_config():
+    global _config_loaded
+    if not _config_loaded:
+        k8s_config.load_incluster_config()
+        _config_loaded = True
+
 
 def get_first_pod_logs(namespace: str, label_selector: str) -> str:
     """Fetches the logs of the first non-terminating pod matching the label selector.
@@ -8,7 +21,10 @@ def get_first_pod_logs(namespace: str, label_selector: str) -> str:
     in-cluster service account. The sandboxed Log Analyst agent has no direct
     K8s API access by cluster policy and calls this over HTTP instead.
     """
-    k8s_config.load_incluster_config()
+    if namespace.lower().strip() in FORBIDDEN_NAMESPACES:
+        raise ValueError(f"Access to namespace '{namespace}' is forbidden.")
+
+    _ensure_config()
     v1 = client.CoreV1Api()
     pods = v1.list_namespaced_pod(namespace, label_selector=label_selector)
     if not pods.items:

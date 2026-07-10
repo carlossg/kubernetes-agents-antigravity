@@ -29,6 +29,12 @@ def fetch_kubernetes_pod_logs(namespace: str, label_selector: str) -> str:
         )
         resp.raise_for_status()
         return resp.json()["logs"]
+    except httpx.HTTPStatusError as e:
+        try:
+            detail = e.response.json().get("detail", e.response.text)
+            return f"Failed to fetch logs via log-proxy: {detail}"
+        except Exception:
+            return f"Failed to fetch logs via log-proxy: {str(e)}"
     except Exception as e:
         return f"Failed to fetch logs via log-proxy: {str(e)}"
 

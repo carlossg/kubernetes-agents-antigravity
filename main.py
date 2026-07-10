@@ -147,6 +147,8 @@ elif args.role == "log-proxy":
         """
         try:
             return {"logs": get_first_pod_logs(namespace, label_selector)}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Log proxy error: {str(e)}")
 

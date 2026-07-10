@@ -3,6 +3,8 @@ import os
 import unittest
 from unittest.mock import patch, MagicMock
 
+import httpx
+
 # Import the agents and tools to test
 from agents.logs import LogAnalystAgent, fetch_kubernetes_pod_logs
 from agents.log_proxy import get_first_pod_logs
@@ -161,6 +163,10 @@ class TestKubernetesAgentTools(unittest.TestCase):
         result = get_first_pod_logs("test-ns", "app=test,role=canary")
         self.assertIn("LOGS FOR POD running-pod", result)
 
+    def test_get_first_pod_logs_forbidden_namespace(self):
+        with self.assertRaises(ValueError):
+            get_first_pod_logs("kube-system", "app=test")
+
     # -- agents.logs: the sandboxed agent's tool, which has no direct K8s API
     # access and must call the log-proxy service over HTTP instead.
 
@@ -191,6 +197,21 @@ class TestKubernetesAgentTools(unittest.TestCase):
         result = fetch_kubernetes_pod_logs("test-ns", "app=test,role=stable")
         self.assertIn("Failed to fetch logs via log-proxy", result)
         self.assertIn("connection refused", result)
+
+    @patch.dict(os.environ, {"LOG_PROXY_URL": "http://kubernetes-agent-log-proxy:8080"})
+    @patch("agents.logs.httpx.get")
+    def test_fetch_kubernetes_pod_logs_proxy_http_error(self, mock_get):
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"detail": "Access to namespace 'kube-system' is forbidden."}
+        mock_response.request = httpx.Request("GET", "http://kubernetes-agent-log-proxy:8080/pod-logs")
+        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "400 Bad Request", request=mock_response.request, response=mock_response
+        )
+        mock_get.return_value = mock_response
+
+        result = fetch_kubernetes_pod_logs("kube-system", "app=test")
+        self.assertIn("Failed to fetch logs via log-proxy", result)
+        self.assertIn("forbidden", result)
 
     @patch("kubernetes.config.load_incluster_config")
     @patch("kubernetes.config.load_kube_config")
