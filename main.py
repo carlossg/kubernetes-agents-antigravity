@@ -11,8 +11,8 @@ from agents.events import EventAnalystAgent
 # Define CLI argument parser
 parser = argparse.ArgumentParser(description="Kubernetes AI/Ops Agent - Google Antigravity SDK")
 parser.add_argument(
-    "--role", 
-    choices=["orchestrator", "logs", "metrics", "events"], 
+    "--role",
+    choices=["orchestrator", "logs", "metrics", "events", "log-proxy"],
     default="orchestrator",
     help="Role of this agent microservice instance (default: orchestrator)"
 )
@@ -133,6 +133,22 @@ elif args.role == "events":
             return {"analysis": report}
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Events analysis error: {str(e)}")
+
+elif args.role == "log-proxy":
+    from agents.log_proxy import get_first_pod_logs
+
+    @app.get("/pod-logs")
+    def pod_logs(namespace: str, label_selector: str):
+        """Trusted in-cluster proxy for fetching pod logs.
+
+        The Log Analyst agent runs in a gVisor Sandbox that cannot mount a
+        service account token (cluster security policy), so it calls this
+        service - which holds the credentials - instead of the K8s API directly.
+        """
+        try:
+            return {"logs": get_first_pod_logs(namespace, label_selector)}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Log proxy error: {str(e)}")
 
 
 if __name__ == "__main__":

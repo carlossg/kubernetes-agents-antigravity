@@ -31,6 +31,8 @@ spec:
                 secretKeyRef:
                   name: argo-rollouts-secret
                   key: GEMINI_API_KEY
+            - name: LOG_PROXY_URL
+              value: "http://kubernetes-agent-log-proxy.argo-rollouts.svc.cluster.local:8080"
           ports:
             - containerPort: 8080
           securityContext:

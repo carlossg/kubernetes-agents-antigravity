@@ -5,6 +5,7 @@ from unittest.mock import patch, MagicMock
 
 # Import the agents and tools to test
 from agents.logs import LogAnalystAgent, fetch_kubernetes_pod_logs
+from agents.log_proxy import get_first_pod_logs
 from agents.metrics import MetricsAnalystAgent, fetch_kubernetes_pod_metrics
 from agents.events import EventAnalystAgent, fetch_kubernetes_namespace_events
 from agents.orchestrator import LeadOrchestratorAgent
@@ -14,12 +15,22 @@ from agents.orchestrator import LeadOrchestratorAgent
 # ----------------------------------------------------------------------
 
 class MockPodMetadata:
+    def __init__(self, name, deletion_timestamp=None):
+        self.name = name
+        self.deletion_timestamp = deletion_timestamp
+
+class MockContainer:
     def __init__(self, name):
         self.name = name
 
+class MockPodSpec:
+    def __init__(self, containers=None):
+        self.containers = containers or [MockContainer("app")]
+
 class MockPodItem:
-    def __init__(self, name):
-        self.metadata = MockPodMetadata(name)
+    def __init__(self, name, deletion_timestamp=None, containers=None):
+        self.metadata = MockPodMetadata(name, deletion_timestamp=deletion_timestamp)
+        self.spec = MockPodSpec(containers=containers)
 
 class MockPodList:
     def __init__(self, items):
@@ -52,7 +63,7 @@ class MockCoreV1Api:
         # Return a list of pods matching the label selector (just mock list)
         return MockPodList(self.pods_items)
 
-    def read_namespaced_pod_log(self, pod_name, namespace, tail_lines=200):
+    def read_namespaced_pod_log(self, pod_name, namespace, container=None, tail_lines=200):
         return self.logs_dict.get(pod_name, "mock log data")
 
     def list_namespaced_event(self, namespace, limit=30):
@@ -97,43 +108,89 @@ class MockAgentInstance:
 
 class TestKubernetesAgentTools(unittest.TestCase):
     
+    # -- agents.log_proxy: the trusted, non-sandboxed service that actually
+    # talks to the K8s API on behalf of the sandboxed Log Analyst agent.
+
     @patch("kubernetes.config.load_incluster_config")
-    @patch("kubernetes.config.load_kube_config")
     @patch("kubernetes.client.CoreV1Api")
-    def test_fetch_kubernetes_pod_logs_healthy(self, mock_core_v1, mock_kube_cfg, mock_in_cluster_cfg):
+    def test_get_first_pod_logs_healthy(self, mock_core_v1, mock_in_cluster_cfg):
         mock_api = MockCoreV1Api(
             pods_items=[MockPodItem("stable-pod-1")],
             logs_dict={"stable-pod-1": "2026-06-25 INFO Application is healthy\nINFO Request processed in 10ms"}
         )
         mock_core_v1.return_value = mock_api
 
-        result = fetch_kubernetes_pod_logs("test-ns", "app=test,role=stable")
+        result = get_first_pod_logs("test-ns", "app=test,role=stable")
         self.assertIn("LOGS FOR POD stable-pod-1", result)
         self.assertIn("Application is healthy", result)
 
     @patch("kubernetes.config.load_incluster_config")
-    @patch("kubernetes.config.load_kube_config")
     @patch("kubernetes.client.CoreV1Api")
-    def test_fetch_kubernetes_pod_logs_unhealthy(self, mock_core_v1, mock_kube_cfg, mock_in_cluster_cfg):
+    def test_get_first_pod_logs_unhealthy(self, mock_core_v1, mock_in_cluster_cfg):
         mock_api = MockCoreV1Api(
             pods_items=[MockPodItem("canary-pod-1")],
             logs_dict={"canary-pod-1": "2026-06-25 ERROR Database connection failed\nTraceback:\nValueError: Connection timeout"}
         )
         mock_core_v1.return_value = mock_api
 
-        result = fetch_kubernetes_pod_logs("test-ns", "app=test,role=canary")
+        result = get_first_pod_logs("test-ns", "app=test,role=canary")
         self.assertIn("LOGS FOR POD canary-pod-1", result)
         self.assertIn("Database connection failed", result)
 
     @patch("kubernetes.config.load_incluster_config")
-    @patch("kubernetes.config.load_kube_config")
     @patch("kubernetes.client.CoreV1Api")
-    def test_fetch_kubernetes_pod_logs_no_pods(self, mock_core_v1, mock_kube_cfg, mock_in_cluster_cfg):
+    def test_get_first_pod_logs_no_pods(self, mock_core_v1, mock_in_cluster_cfg):
         mock_api = MockCoreV1Api(pods_items=[])
         mock_core_v1.return_value = mock_api
 
-        result = fetch_kubernetes_pod_logs("test-ns", "app=test,role=canary")
+        result = get_first_pod_logs("test-ns", "app=test,role=canary")
         self.assertEqual(result, "No pods found in namespace 'test-ns' matching selector 'app=test,role=canary'")
+
+    @patch("kubernetes.config.load_incluster_config")
+    @patch("kubernetes.client.CoreV1Api")
+    def test_get_first_pod_logs_skips_terminating_pod(self, mock_core_v1, mock_in_cluster_cfg):
+        mock_api = MockCoreV1Api(
+            pods_items=[
+                MockPodItem("terminating-pod", deletion_timestamp="2026-06-25T00:00:00Z"),
+                MockPodItem("running-pod"),
+            ],
+            logs_dict={"running-pod": "INFO all good"}
+        )
+        mock_core_v1.return_value = mock_api
+
+        result = get_first_pod_logs("test-ns", "app=test,role=canary")
+        self.assertIn("LOGS FOR POD running-pod", result)
+
+    # -- agents.logs: the sandboxed agent's tool, which has no direct K8s API
+    # access and must call the log-proxy service over HTTP instead.
+
+    @patch.dict(os.environ, {"LOG_PROXY_URL": "http://kubernetes-agent-log-proxy:8080"})
+    @patch("agents.logs.httpx.get")
+    def test_fetch_kubernetes_pod_logs_calls_proxy(self, mock_get):
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"logs": "--- LOGS FOR POD stable-pod-1 ---\nINFO healthy"}
+        mock_get.return_value = mock_response
+
+        result = fetch_kubernetes_pod_logs("test-ns", "app=test,role=stable")
+
+        mock_get.assert_called_once_with(
+            "http://kubernetes-agent-log-proxy:8080/pod-logs",
+            params={"namespace": "test-ns", "label_selector": "app=test,role=stable"},
+            timeout=30.0,
+        )
+        self.assertIn("LOGS FOR POD stable-pod-1", result)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_fetch_kubernetes_pod_logs_no_proxy_url(self):
+        result = fetch_kubernetes_pod_logs("test-ns", "app=test,role=stable")
+        self.assertIn("LOG_PROXY_URL is not configured", result)
+
+    @patch.dict(os.environ, {"LOG_PROXY_URL": "http://kubernetes-agent-log-proxy:8080"})
+    @patch("agents.logs.httpx.get", side_effect=Exception("connection refused"))
+    def test_fetch_kubernetes_pod_logs_proxy_error(self, mock_get):
+        result = fetch_kubernetes_pod_logs("test-ns", "app=test,role=stable")
+        self.assertIn("Failed to fetch logs via log-proxy", result)
+        self.assertIn("connection refused", result)
 
     @patch("kubernetes.config.load_incluster_config")
     @patch("kubernetes.config.load_kube_config")
