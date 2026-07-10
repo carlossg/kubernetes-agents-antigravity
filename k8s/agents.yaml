@@ -78,7 +78,7 @@ spec:
       containers:
         - name: agent
           image: kubernetes-agents-antigravity:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           args: ["--role", "metrics"]
           env:
             - name: GEMINI_API_KEY
@@ -123,7 +123,7 @@ spec:
       containers:
         - name: agent
           image: kubernetes-agents-antigravity:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           args: ["--role", "events"]
           env:
             - name: GEMINI_API_KEY
@@ -168,7 +168,7 @@ spec:
       containers:
         - name: agent
           image: kubernetes-agents-antigravity:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           args: ["--role", "orchestrator"]
           env:
             - name: GEMINI_API_KEY

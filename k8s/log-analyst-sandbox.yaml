@@ -23,7 +23,7 @@ spec:
       containers:
         - name: agent
           image: kubernetes-agents-antigravity:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           args: ["--role", "logs"]
           env:
             - name: GEMINI_API_KEY

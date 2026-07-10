@@ -12,6 +12,7 @@ def fetch_kubernetes_pod_logs(namespace: str, label_selector: str) -> str:
         namespace: The target Kubernetes namespace.
         label_selector: Label selector to identify the pods (e.g. 'role=canary').
     """
+    print(f"[Tool] fetch_kubernetes_pod_logs called for namespace={namespace}, selector={label_selector}")
     try:
         k8s_config.load_incluster_config()
     except Exception:
@@ -72,7 +73,7 @@ class LogAnalystAgent:
     async def analyze(self, namespace: str, stable_selector: str, canary_selector: str, extra_prompt: str = "") -> str:
         prompt = (
             f"Analyze logs for stable selector '{stable_selector}' and canary selector '{canary_selector}' "
-            f"in namespace '{namespace}'."
+            f"in namespace '{namespace}'. You MUST invoke the 'fetch_kubernetes_pod_logs' tool for both the stable and canary selectors to get the real logs. Do NOT speculate or simulate logs."
         )
         if extra_prompt:
             prompt += f"\nAdditional Context: {extra_prompt}"
