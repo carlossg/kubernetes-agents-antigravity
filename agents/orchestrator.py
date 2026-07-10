@@ -49,10 +49,12 @@ class LeadOrchestratorAgent:
         events_url = os.getenv("EVENTS_AGENT_URL")
 
         # Define helper for calling agents (either HTTP or local fallback)
+        SUBAGENT_TIMEOUT = 90.0
+
         async def run_logs():
             if logs_url:
                 try:
-                    async with httpx.AsyncClient(timeout=300.0) as client:
+                    async with httpx.AsyncClient(timeout=SUBAGENT_TIMEOUT) as client:
                         payload = {
                             "namespace": namespace,
                             "stableSelector": stable_selector,
@@ -72,7 +74,7 @@ class LeadOrchestratorAgent:
         async def run_metrics():
             if metrics_url:
                 try:
-                    async with httpx.AsyncClient(timeout=300.0) as client:
+                    async with httpx.AsyncClient(timeout=SUBAGENT_TIMEOUT) as client:
                         payload = {
                             "namespace": namespace,
                             "stableSelector": stable_selector,
@@ -92,7 +94,7 @@ class LeadOrchestratorAgent:
         async def run_events():
             if events_url:
                 try:
-                    async with httpx.AsyncClient(timeout=300.0) as client:
+                    async with httpx.AsyncClient(timeout=SUBAGENT_TIMEOUT) as client:
                         payload = {
                             "namespace": namespace,
                             "stableSelector": stable_selector,
