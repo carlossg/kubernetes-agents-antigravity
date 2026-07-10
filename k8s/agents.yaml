@@ -45,6 +45,57 @@ spec:
     app: kubernetes-agent-logs
 ---
 # -----------------------------------------------------------------------------
+# Log Proxy Service & Deployment
+#
+# The Log Analyst agent runs in a gVisor Sandbox, which by cluster security
+# policy (secure-sandbox-policy) cannot mount a service account token and has
+# no direct K8s API access. This trusted, non-sandboxed service holds the
+# service account and fetches pod logs on its behalf over HTTP.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubernetes-agent-log-proxy
+  namespace: argo-rollouts
+spec:
+  ports:
+    - port: 8080
+      targetPort: 8080
+  selector:
+    app: kubernetes-agent-log-proxy
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubernetes-agent-log-proxy
+  namespace: argo-rollouts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubernetes-agent-log-proxy
+  template:
+    metadata:
+      labels:
+        app: kubernetes-agent-log-proxy
+    spec:
+      serviceAccountName: kubernetes-agents-sa
+      containers:
+        - name: agent
+          image: kubernetes-agents-antigravity:latest
+          imagePullPolicy: Always
+          args: ["--role", "log-proxy"]
+          ports:
+            - containerPort: 8080
+          resources:
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+---
+# -----------------------------------------------------------------------------
 # Metrics Analyst Service & Deployment
 # -----------------------------------------------------------------------------
 apiVersion: v1
