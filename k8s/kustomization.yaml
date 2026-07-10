@@ -6,3 +6,8 @@ namespace: argo-rollouts
 resources:
   - agents.yaml
   - log-analyst-sandbox.yaml
+
+images:
+  - name: kubernetes-agents-antigravity
+    newName: us-central1-docker.pkg.dev/api-project-642841493686/github/kubernetes-agents-antigravity
+    newTag: latest
