@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.log
 .env
+.claude/settings.local.json
 
 # Regenerable build-demo intermediates (see demo-recording/build-demo/build.py)
 demo-recording/.venv/
