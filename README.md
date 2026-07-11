@@ -4,6 +4,19 @@ This repository implements a **Collaborative Team of Specialized AI Agents** to 
 
 ---
 
+## Demo
+
+<video src="https://github.com/user-attachments/assets/a2da0dde-814c-4f1b-8a2c-e58d13e17643" controls width="100%">
+  Your browser (or viewer) doesn't render inline video — download it
+  <a href="https://github.com/user-attachments/assets/a2da0dde-814c-4f1b-8a2c-e58d13e17643">directly</a>.
+</video>
+
+Narrated walkthrough: agent architecture, a healthy `green` release getting
+unanimously promoted, then a broken `bad-red` release getting debated and
+correctly aborted.
+
+---
+
 ## Architecture Diagram
 
 The diagram below outlines the relationships between Argo Rollouts, the metric plugin, and the distributed agent team:
