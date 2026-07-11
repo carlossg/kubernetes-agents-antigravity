@@ -5,10 +5,15 @@ cases) with asciinema, then turns it into a narrated MP4.
 
 ## Demo
 
-![AI canary analysis demo](ai-canary-demo.gif)
+<video src="ai-canary-demo-narrated.mp4" controls width="100%">
+  Your browser (or viewer) doesn't render inline video — download
+  <a href="ai-canary-demo-narrated.mp4">ai-canary-demo-narrated.mp4</a> directly.
+</video>
 
-The GIF above is the raw screen recording (silent). For the narrated version
-with voiceover, watch [`ai-canary-demo-narrated.mp4`](ai-canary-demo-narrated.mp4).
+Narrated walkthrough: agent architecture, a healthy `green` release getting
+unanimously promoted, then a broken `bad-red` release getting debated and
+correctly aborted. A silent GIF of the raw recording is also available:
+[`ai-canary-demo.gif`](ai-canary-demo.gif).
 
 ## Prerequisites
 
