@@ -1,3 +1,11 @@
 __pycache__/
 *.pyc
 *.log
+.env
+
+# Regenerable build-demo intermediates (see demo-recording/build-demo/build.py)
+demo-recording/.venv/
+demo-recording/build-demo/audio/
+demo-recording/build-demo/segments/
+demo-recording/build-demo/images/
+demo-recording/build-demo/concat.txt
