@@ -31,6 +31,9 @@ spec:
                 secretKeyRef:
                   name: argo-rollouts-secret
                   key: GEMINI_API_KEY
+            # uid 1000 has no home dir; the Antigravity SDK needs a writable one
+            - name: HOME
+              value: /tmp
             - name: LOG_PROXY_URL
               value: "http://kubernetes-agent-log-proxy.argo-rollouts.svc.cluster.local:8080"
           ports:

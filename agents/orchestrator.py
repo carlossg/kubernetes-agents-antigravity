@@ -5,6 +5,11 @@ from google.antigravity import Agent, LocalAgentConfig
 from agents.logs import LogAnalystAgent
 from agents.metrics import MetricsAnalystAgent
 from agents.events import EventAnalystAgent
+from agents import activity
+from agents.remediation import remediate
+
+# Keep the verdict inside the metric plugin's HTTP client timeout.
+REMEDIATION_TIMEOUT_SECONDS = 150
 
 class LeadOrchestratorAgent:
     def __init__(self, model: str | None = None, log_model: str | None = None, metrics_model: str | None = None, event_model: str | None = None):
@@ -23,6 +28,7 @@ class LeadOrchestratorAgent:
                 '  "analysis": "detailed synthesis of findings",\n'
                 '  "rootCause": "root cause of any issue, empty if promote is true",\n'
                 '  "remediation": "remediation steps or PR recommendations, empty if promote is true",\n'
+                '  "codeBug": true only if the root cause is a bug in application source code (for example an exception with a stack trace pointing at the app\'s own classes) that a code change can fix; false for operational issues such as memory leaks, resource exhaustion, latency or infrastructure problems,\n'
                 '  "votingRationale": "summary of the team debate and how you resolved conflicts"\n'
                 "}\n"
                 "Ensure your response is valid JSON that can be parsed directly by json.loads()."
@@ -39,7 +45,9 @@ class LeadOrchestratorAgent:
         rollout_name: str, 
         stable_selector: str, 
         canary_selector: str, 
-        extra_prompt: str = ""
+        extra_prompt: str = "",
+        repo_url: str = "",
+        base_branch: str = "main",
     ) -> dict:
         import os
         import httpx
@@ -50,6 +58,14 @@ class LeadOrchestratorAgent:
 
         # Define helper for calling agents (either HTTP or local fallback)
         SUBAGENT_TIMEOUT = 90.0
+
+        async def tracked(name: str, coro):
+            activity.feed.emit(activity.AGENT_START, name, f"Analyzing rollout '{rollout_name}'")
+            activity.feed.emit(activity.TOOL_CALL, name, f"namespace={namespace} stable={stable_selector} canary={canary_selector}")
+            report = await coro
+            activity.feed.emit(activity.TOOL_RESULT, name, report[:500])
+            activity.feed.emit(activity.AGENT_COMPLETE, name)
+            return report
 
         async def run_logs():
             if logs_url:
@@ -114,8 +130,15 @@ class LeadOrchestratorAgent:
 
         # Execute specialized analyses concurrently
         print(f"[Orchestrator] Starting concurrent subagent evaluations for rollout '{rollout_name}'...")
+        activity.feed.emit(
+            activity.ANALYSIS_START,
+            f"Analyzing canary rollout '{rollout_name}'",
+            f"namespace={namespace} stable={stable_selector} canary={canary_selector}",
+        )
         logs_report, metrics_report, events_report = await asyncio.gather(
-            run_logs(), run_metrics(), run_events()
+            tracked("LogAnalystAgent", run_logs()),
+            tracked("MetricsAnalystAgent", run_metrics()),
+            tracked("EventAnalystAgent", run_events()),
         )
 
         print("[Orchestrator] Subagent evaluations completed. Aggregating reports for consensus debate...")
@@ -152,6 +175,42 @@ class LeadOrchestratorAgent:
                 "remediation": "Check orchestrator agent logic",
                 "votingRationale": "Raw text was not valid JSON"
             }
+
+        verdict = "PROMOTE" if result.get("promote") else "ABORT"
+        activity.feed.emit(
+            activity.DECISION,
+            f"{verdict}: {str(result.get('analysis', ''))[:200]}",
+            result.get("rootCause", ""),
+        )
+        activity.feed.emit(activity.CONFIDENCE_SCORE, f"Confidence {result.get('confidence', 0)}%")
+
+        if not result.get("promote") and result.get("codeBug") and repo_url:
+            try:
+                pr_url = await asyncio.wait_for(
+                    remediate(
+                        repo_url=repo_url,
+                        base_branch=base_branch,
+                        rollout_name=rollout_name,
+                        namespace=namespace,
+                        root_cause=result.get("rootCause", ""),
+                        logs_report=logs_report,
+                        analysis=str(result.get("analysis", "")),
+                    ),
+                    timeout=REMEDIATION_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pr_url = None
+                activity.feed.emit(activity.REMEDIATION, "Remediation timed out; no pull request created")
+            if pr_url:
+                result["prLink"] = pr_url
+        elif not result.get("promote"):
+            activity.feed.emit(
+                activity.REMEDIATION,
+                "No pull request: operational issue, not a source-code bug",
+                result.get("rootCause", ""),
+            )
+
+        activity.feed.emit(activity.ANALYSIS_SUMMARY, f"Analysis of '{rollout_name}' complete: {verdict}")
 
         # Inject individual subagent results for trace reports
         result["modelResults"] = [

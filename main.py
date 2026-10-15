@@ -7,6 +7,7 @@ from agents.orchestrator import LeadOrchestratorAgent
 from agents.logs import LogAnalystAgent
 from agents.metrics import MetricsAnalystAgent
 from agents.events import EventAnalystAgent
+from agents import activity
 
 # Define CLI argument parser
 parser = argparse.ArgumentParser(description="Kubernetes AI/Ops Agent - Google Antigravity SDK")
@@ -55,6 +56,8 @@ if args.role == "orchestrator":
         stable_selector = ctx.get("stableSelector")
         canary_selector = ctx.get("canarySelector")
         extra_prompt = ctx.get("extraPrompt", "")
+        repo_url = ctx.get("repoUrl", "")
+        base_branch = ctx.get("baseBranch") or "main"
 
         # Extract optional model configurations from the request context
         model = ctx.get("model")
@@ -80,11 +83,19 @@ if args.role == "orchestrator":
                 rollout_name=rollout_name,
                 stable_selector=stable_selector,
                 canary_selector=canary_selector,
-                extra_prompt=extra_prompt
+                extra_prompt=extra_prompt,
+                repo_url=repo_url,
+                base_branch=base_branch
             )
             return result
         except Exception as e:
+            activity.feed.emit(activity.ERROR, "Orchestrator error", str(e))
             raise HTTPException(status_code=500, detail=f"Internal orchestrator error: {str(e)}")
+
+    @app.get("/a2a/events")
+    def activity_events(since: Optional[int] = None):
+        """Activity feed polled by the quarkus-demo dashboard."""
+        return activity.feed.events(since)
 
 elif args.role == "logs":
     @app.post("/analyze/logs")

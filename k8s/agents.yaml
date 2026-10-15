@@ -227,6 +227,13 @@ spec:
                 secretKeyRef:
                   name: argo-rollouts-secret
                   key: GEMINI_API_KEY
+            # Optional: lets the RemediationAgent open fix PRs for code bugs
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: argo-rollouts-secret
+                  key: GITHUB_TOKEN
+                  optional: true
             - name: LOGS_AGENT_URL
               value: "http://kubernetes-agent-logs.argo-rollouts.svc.cluster.local:8080"
             - name: METRICS_AGENT_URL
