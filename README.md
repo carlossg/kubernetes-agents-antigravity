@@ -117,14 +117,14 @@ The agent microservices run a single unified Docker container image, configured 
 
 ## Remediation Pull Requests & Activity Feed
 
-When the consensus verdict is ABORT and the root cause is a bug in application source code (`codeBug: true`), the orchestrator runs a **Remediation Agent** ([agents/remediation.py](agents/remediation.py)). It reads the offending file from the GitHub repository (`repoUrl` / `baseBranch` from the analysis context), asks Gemini for a minimal fix, and opens a pull request. The branch, commit and PR are created by code, not by the LLM. Operational issues (memory leaks, resource exhaustion) get no PR. Remediation is capped at 150s so it cannot delay the verdict.
+When the consensus verdict is ABORT and the root cause is a bug in application source code (`codeBug: true`), the orchestrator runs a **Remediation Agent** ([agents/remediation.py](agents/remediation.py)). It reads the offending file from the GitHub repository (`repoUrl` / `baseBranch` from the analysis context), asks Gemini for a minimal fix, and opens a pull request, then files a GitHub issue labeled `jules` that links to it. The branch, commit, PR and issue are created by code, not by the LLM. Operational issues (memory leaks, resource exhaustion) get no PR. Remediation is capped at 150s.
 
 Set the GitHub token (needs `contents` and `pull requests` write access on the target repo) in the secret read by the orchestrator:
 ```bash
 kubectl create secret generic argo-rollouts-secret -n argo-rollouts \
   --from-literal=GITHUB_TOKEN=<token> --dry-run=client -o yaml | kubectl apply -f -
 ```
-The variable is optional: without it remediation is skipped and a `REMEDIATION` event says so. The PR URL is returned as `prLink` in the `/a2a/analyze` response.
+The variable is optional: without it remediation is skipped and a `REMEDIATION` event says so. Remediation runs in the background so the verdict is returned immediately; the PR and issue URLs are published to the activity feed.
 
 The orchestrator also exposes `GET /a2a/events?since=<id>`, an in-memory activity feed (analysis, per-agent tool calls, decision, remediation) polled by the quarkus-demo dashboard.
 

@@ -8,8 +8,16 @@ from agents.events import EventAnalystAgent
 from agents import activity
 from agents.remediation import remediate
 
-# Keep the verdict inside the metric plugin's HTTP client timeout.
 REMEDIATION_TIMEOUT_SECONDS = 150
+_background_tasks: set = set()
+
+
+async def _remediate_with_timeout(**kwargs):
+    try:
+        return await asyncio.wait_for(remediate(**kwargs), timeout=REMEDIATION_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        activity.feed.emit(activity.REMEDIATION, "Remediation timed out; no pull request created")
+        return None
 
 class LeadOrchestratorAgent:
     def __init__(self, model: str | None = None, log_model: str | None = None, metrics_model: str | None = None, event_model: str | None = None):
@@ -185,24 +193,21 @@ class LeadOrchestratorAgent:
         activity.feed.emit(activity.CONFIDENCE_SCORE, f"Confidence {result.get('confidence', 0)}%")
 
         if not result.get("promote") and result.get("codeBug") and repo_url:
-            try:
-                pr_url = await asyncio.wait_for(
-                    remediate(
-                        repo_url=repo_url,
-                        base_branch=base_branch,
-                        rollout_name=rollout_name,
-                        namespace=namespace,
-                        root_cause=result.get("rootCause", ""),
-                        logs_report=logs_report,
-                        analysis=str(result.get("analysis", "")),
-                    ),
-                    timeout=REMEDIATION_TIMEOUT_SECONDS,
+            # Run in the background: the verdict must not wait for the PR, or the rollout can
+            # finish promoting before the analysis result reaches Argo Rollouts.
+            task = asyncio.create_task(
+                _remediate_with_timeout(
+                    repo_url=repo_url,
+                    base_branch=base_branch,
+                    rollout_name=rollout_name,
+                    namespace=namespace,
+                    root_cause=result.get("rootCause", ""),
+                    logs_report=logs_report,
+                    analysis=str(result.get("analysis", "")),
                 )
-            except asyncio.TimeoutError:
-                pr_url = None
-                activity.feed.emit(activity.REMEDIATION, "Remediation timed out; no pull request created")
-            if pr_url:
-                result["prLink"] = pr_url
+            )
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
         elif not result.get("promote"):
             activity.feed.emit(
                 activity.REMEDIATION,

@@ -1,8 +1,9 @@
 import asyncio
 import base64
+import json
 import os
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
@@ -59,6 +60,21 @@ class GitHubRepoTests(unittest.TestCase):
         self.assertEqual(url, "https://github.com/o/r/pull/1")
         self.assertEqual(calls[-1], ("POST", "/repos/o/r/pulls"))
 
+    def test_create_issue_sends_label(self):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["path"] = request.url.path
+            seen["json"] = json.loads(request.content)
+            return httpx.Response(201, json={"html_url": "https://github.com/o/r/issues/2"})
+
+        client = httpx.Client(base_url="https://api.github.com", transport=httpx.MockTransport(handler))
+        gh = GitHubRepo("https://github.com/o/r", "tok", "main", client=client)
+        url = gh.create_issue("T", "B", ["jules"])
+        self.assertEqual(url, "https://github.com/o/r/issues/2")
+        self.assertEqual(seen["path"], "/repos/o/r/issues")
+        self.assertEqual(seen["json"]["labels"], ["jules"])
+
     def test_api_error_raises(self):
         client = httpx.Client(
             base_url="https://api.github.com",
@@ -81,6 +97,20 @@ class RemediateTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await remediate("https://github.com/o/r", "main", "ro", "ns", "NPE", "logs", "analysis")
         self.assertIsNone(result)
+
+    async def test_creates_pr_then_labeled_issue_and_survives_issue_failure(self):
+        fix = {"path": "A.java", "newContent": "x", "title": "t", "summary": "s"}
+        for issue_effect in ("https://github.com/o/r/issues/2", RuntimeError("boom")):
+            create_issue = MagicMock(side_effect=[issue_effect] if isinstance(issue_effect, Exception) else None,
+                                     return_value=None if isinstance(issue_effect, Exception) else issue_effect)
+            with patch.dict(os.environ, {"GITHUB_TOKEN": "tok"}), patch(
+                "agents.remediation.RemediationAgent.propose_fix", new=AsyncMock(return_value=fix)
+            ), patch("agents.remediation.GitHubRepo.create_pull_request", return_value="https://github.com/o/r/pull/1"), patch(
+                "agents.remediation.GitHubRepo.create_issue", create_issue
+            ):
+                result = await remediate("https://github.com/o/r", "main", "ro", "ns", "NPE", "logs", "analysis")
+            self.assertEqual(result, "https://github.com/o/r/pull/1")
+            self.assertEqual(create_issue.call_args.args[2], ["jules"])
 
 
 if __name__ == "__main__":

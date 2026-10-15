@@ -93,6 +93,13 @@ class GitHubRepo:
         )
         return pr["html_url"]
 
+    def create_issue(self, title: str, body: str, labels: list[str]) -> str:
+        issue = self._request("POST", "/issues", json={"title": title, "body": body, "labels": labels})
+        return issue["html_url"]
+
+
+ISSUE_LABEL = "jules"
+
 
 def extract_json(text: str) -> dict:
     match = re.search(r"\{.*\}", text, re.DOTALL)
@@ -202,6 +209,19 @@ async def remediate(
         )
         pr_url = gh.create_pull_request(path, fix["newContent"], title, body, branch)
         activity.feed.emit(activity.REMEDIATION, f"Pull request created: {title}", pr_url)
+
+        # The PR is already open; an issue failure must not discard it.
+        try:
+            issue_body = (
+                f"Canary rollout `{namespace}/{rollout_name}` was rejected.\n\n"
+                f"**Root cause**\n{root_cause}\n\n**Proposed fix**: {pr_url}\n\n"
+                f"**Analysis**\n{analysis}"
+            )
+            issue_url = gh.create_issue(title, issue_body, [ISSUE_LABEL])
+            activity.feed.emit(activity.REMEDIATION, f"Issue created (label '{ISSUE_LABEL}'): {title}", issue_url)
+        except Exception as e:
+            activity.feed.emit(activity.ERROR, "Issue creation failed", str(e))
+
         activity.feed.emit(activity.AGENT_COMPLETE, "RemediationAgent", pr_url)
         return pr_url
     except Exception as e:
