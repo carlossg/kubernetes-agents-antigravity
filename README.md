@@ -109,7 +109,7 @@ The agent microservices run a single unified Docker container image, configured 
 2. **Log Analyst (`--role logs`)**
    * Configured via [logs.py](file:///Users/sanchezg/dev/carlossg/argo-rollouts/rollouts-plugin-metric-ai/kubernetes-agents-antigravity/agents/logs.py).
    * Runs the `LogAnalystAgent` which calls `fetch_kubernetes_pod_logs` to analyze application log differences between stable and canary versions.
-   * This is the only agent that runs inside a **gVisor sandbox** (see [Sandboxed Log Analyst & Log Proxy](#sandboxed-log-analyst--log-proxy) below) instead of a plain Deployment, since it is the only agent whose tool call is derived from LLM output rather than a fixed, code-defined query.
+   * This is the only agent that runs inside a **gVisor sandbox** (see [Sandboxed Log Analyst & Log Proxy](#sandboxed-log-analyst--log-proxy) below) instead of a plain Deployment, since it is the only agent that ingests free-form, workload-authored text (pod logs) that can carry prompt injection. The metrics and events agents also take LLM-chosen tool arguments but read structured system data, so they run as plain Deployments.
 3. **Metrics Analyst (`--role metrics`)**
    * Configured via [metrics.py](file:///Users/sanchezg/dev/carlossg/argo-rollouts/rollouts-plugin-metric-ai/kubernetes-agents-antigravity/agents/metrics.py).
    * Runs the `MetricsAnalystAgent` which calls `fetch_kubernetes_pod_metrics` to verify that CPU or memory consumption has not experienced spikes or leaks.
@@ -138,7 +138,7 @@ The orchestrator also exposes `GET /a2a/events?since=<id>`, an in-memory activit
 
 ## Sandboxed Log Analyst & Log Proxy
 
-The Log Analyst is the only agent whose Kubernetes queries (namespace and label selector) are chosen by the LLM rather than passed in as fixed values from the orchestrator's request context. To limit the blast radius if the model is tricked into requesting logs from an unintended namespace, it runs with defense in depth:
+The Log Analyst is the only agent that consumes untrusted, workload-authored text (pod logs), and its Kubernetes queries (namespace and label selector) are chosen by the LLM. To limit the blast radius if the model is tricked into requesting logs from an unintended namespace, it runs with defense in depth:
 
 * **gVisor sandbox** — [k8s/log-analyst-sandbox.yaml](file:///Users/sanchezg/dev/carlossg/argo-rollouts/rollouts-plugin-metric-ai/kubernetes-agents-antigravity/k8s/log-analyst-sandbox.yaml) deploys it as a `Sandbox` custom resource (`agents.x-k8s.io/v1alpha1`) rather than a plain `Deployment`. It sets `runtimeClassName: gvisor`, schedules onto `sandbox.gke.io/runtime: gvisor` nodes, and sets `automountServiceAccountToken: false`, so the pod has no Kubernetes API credentials at all even if compromised.
 * **Trusted log-proxy service** — since the sandboxed pod can't call the Kubernetes API directly, its `fetch_kubernetes_pod_logs` tool ([agents/logs.py](file:///Users/sanchezg/dev/carlossg/argo-rollouts/rollouts-plugin-metric-ai/kubernetes-agents-antigravity/agents/logs.py)) calls out over HTTP (`LOG_PROXY_URL`) to the `kubernetes-agent-log-proxy` Deployment, a normal (non-sandboxed) service that holds the `kubernetes-agents-sa` ServiceAccount and its cluster-wide pod/log read access.

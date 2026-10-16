@@ -64,7 +64,7 @@ graph TB
 | Component | Runs as | Role |
 |-----------|---------|------|
 | Lead Orchestrator | Deployment | Receives `/a2a/analyze`, runs the three specialists concurrently, hosts the consensus debate, returns the verdict, starts remediation, and serves the activity feed (`/a2a/events`) |
-| Log Analyst | **Sandbox CR in gVisor** | Analyzes pod logs. The only agent whose tool call is chosen by the LLM, so it is isolated |
+| Log Analyst | **Sandbox CR in gVisor** | Analyzes pod logs. The only agent reading untrusted, workload-authored text (logs can carry prompt injection), so it is isolated |
 | Metrics Analyst | Deployment | Compares canary and stable CPU/memory via the Metrics Server |
 | Events Analyst | Deployment | Reads Kubernetes events for the canary pods |
 | Log Proxy | Deployment (trusted) | Holds the ServiceAccount and serves `GET /pod-logs` to the sandboxed Log Analyst |
