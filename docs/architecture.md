@@ -89,5 +89,9 @@ graph TB
 | Log Proxy | The only component with pod/log read access, behind a narrow HTTP endpoint |
 | `runAsNonRoot`, uid 1000 | No root in the container (the SDK needs `HOME=/tmp`) |
 
+### Scope of the boundary
+
+Logs are the highest-risk input: unstructured text written by the workload under test, so a bad canary can embed prompt-injection text. Metrics are numeric and events are short system messages (though events can carry free text). All three analysts let the LLM choose tool arguments (namespace, label selector). The Metrics and Events analysts run as plain Deployments with in-process access to the Metrics Server and Kubernetes API. The sandbox therefore contains the riskiest input but is not a complete boundary. Sandboxing them too is a possible hardening step.
+
 Manifests: [`k8s/agents.yaml`](../k8s/agents.yaml) and [`k8s/log-analyst-sandbox.yaml`](../k8s/log-analyst-sandbox.yaml).
 The sandbox needs a `gvisor` RuntimeClass (GKE Sandbox) and the `agents.x-k8s.io` Sandbox CRD.
