@@ -124,6 +124,8 @@ Set the GitHub token (needs `contents` and `pull requests` write access on the t
 kubectl create secret generic argo-rollouts-secret -n argo-rollouts \
   --from-literal=GITHUB_TOKEN=<token> --dry-run=client -o yaml | kubectl apply -f -
 ```
+Models are pinned in `k8s/agents.yaml` via `*_AGENT_MODEL` env vars: `gemini-3.8-flash` for the log, metrics and event analysts, `gemini-4-argon` for the orchestrator consensus and remediation agent.
+
 The variable is optional: without it remediation is skipped and a `REMEDIATION` event says so. Remediation runs in the background so the verdict is returned immediately; the PR and issue URLs are published to the activity feed.
 
 The orchestrator also exposes `GET /a2a/events?since=<id>`, an in-memory activity feed (analysis, per-agent tool calls, decision, remediation) polled by the quarkus-demo dashboard.

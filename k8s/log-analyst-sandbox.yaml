@@ -26,6 +26,8 @@ spec:
           imagePullPolicy: Always
           args: ["--role", "logs"]
           env:
+            - name: LOGS_AGENT_MODEL
+              value: gemini-3.8-flash
             - name: GEMINI_API_KEY
               valueFrom:
                 secretKeyRef:

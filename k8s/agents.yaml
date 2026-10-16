@@ -132,6 +132,8 @@ spec:
           imagePullPolicy: Always
           args: ["--role", "metrics"]
           env:
+            - name: METRICS_AGENT_MODEL
+              value: gemini-3.8-flash
             - name: GEMINI_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -177,6 +179,8 @@ spec:
           imagePullPolicy: Always
           args: ["--role", "events"]
           env:
+            - name: EVENTS_AGENT_MODEL
+              value: gemini-3.8-flash
             - name: GEMINI_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -222,6 +226,16 @@ spec:
           imagePullPolicy: Always
           args: ["--role", "orchestrator"]
           env:
+            - name: ORCHESTRATOR_AGENT_MODEL
+              value: gemini-4-argon
+            - name: REMEDIATION_AGENT_MODEL
+              value: gemini-4-argon
+            - name: EVENTS_AGENT_MODEL
+              value: gemini-3.8-flash
+            - name: METRICS_AGENT_MODEL
+              value: gemini-3.8-flash
+            - name: LOGS_AGENT_MODEL
+              value: gemini-3.8-flash
             - name: GEMINI_API_KEY
               valueFrom:
                 secretKeyRef:
