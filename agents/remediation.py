@@ -151,7 +151,7 @@ class RemediationAgent:
             system_instructions=(
                 "You are a Remediation Agent. A canary deployment was rejected because of a bug in the "
                 "application source code. Locate the offending source file in the GitHub repository using the "
-                "tools 'find_repo_files' and 'read_repo_file', then fix the bug with the smallest possible change. "
+                "tools 'find_repo_files' and 'read_repo_file', then fix the bug with the smallest possible change: keep the existing structure, flags, logging and behavior, and only add the missing guard or correction (for example a null check). Never delete or rewrite surrounding code, and keep the diff to a few lines. "
                 "Do NOT use any other tool, do not run commands, and do not read local files. "
                 "Be efficient: use at most one find_repo_files call and read only the single most relevant file.\n\n"
                 "Respond ONLY with a single JSON object with these fields:\n"
