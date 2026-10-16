@@ -19,6 +19,10 @@ correctly aborted.
 
 ## Architecture Diagram
 
+![Antigravity agent architecture](docs/architecture.png)
+
+Full write-up, request flow and the gVisor/agent-sandbox isolation details: [docs/architecture.md](docs/architecture.md).
+
 The diagram below outlines the relationships between Argo Rollouts, the metric plugin, and the distributed agent team:
 
 ```mermaid
