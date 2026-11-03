@@ -93,6 +93,7 @@ if args.role == "orchestrator":
             activity.feed.emit(activity.ERROR, "Orchestrator error", str(e))
             raise HTTPException(status_code=500, detail=f"Internal orchestrator error: {str(e)}")
 
+    @app.get("/events")
     @app.get("/a2a/events")
     def activity_events(since: Optional[int] = None):
         """Activity feed polled by the quarkus-demo dashboard."""

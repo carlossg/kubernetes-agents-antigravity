@@ -425,6 +425,8 @@ class TestOrchestratorEndpoints(unittest.TestCase):
         routes = [route.path for route in app.routes]
         self.assertIn("/analyze", routes, "Expected /analyze route in orchestrator app")
         self.assertIn("/a2a/analyze", routes, "Expected /a2a/analyze route in orchestrator app")
+        self.assertIn("/events", routes, "Expected /events route in orchestrator app")
+        self.assertIn("/a2a/events", routes, "Expected /a2a/events route in orchestrator app")
 
 
 if __name__ == "__main__":
