@@ -9,5 +9,6 @@ resources:
 
 images:
   - name: kubernetes-agents-antigravity
-    newName: us-central1-docker.pkg.dev/api-project-642841493686/github/kubernetes-agents-antigravity
-    newTag: latest
+    newName: ghcr.io/carlossg/kubernetes-agents-antigravity
+    newTag: 0.1.0
+    digest: sha256:06675bc4bf11be6856c9af42352e8723fc68c14bc6386b4121700b3fcaa3276e
