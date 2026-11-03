@@ -19,7 +19,7 @@ parser.add_argument(
 )
 parser.add_argument("--host", default="0.0.0.0", help="HTTP server host")
 parser.add_argument("--port", type=int, default=8080, help="HTTP server port")
-args = parser.parse_args()
+args, _ = parser.parse_known_args()
 
 app = FastAPI(title=f"Kubernetes AI/Ops Agent ({args.role}) - Google Antigravity SDK")
 
@@ -44,6 +44,7 @@ def health_check():
 
 # Define endpoints based on CLI role
 if args.role == "orchestrator":
+    @app.post("/analyze")
     @app.post("/a2a/analyze")
     async def analyze_canary(request: A2ARequest):
         """

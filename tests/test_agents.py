@@ -418,5 +418,14 @@ class TestLeadOrchestratorAgent(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["modelResults"][1]["promote"]) # Metrics analyst promote: False
         self.assertFalse(result["modelResults"][2]["promote"]) # Event analyst promote: False
 
+
+class TestOrchestratorEndpoints(unittest.TestCase):
+    def test_routes_include_analyze_and_a2a_analyze(self):
+        from main import app
+        routes = [route.path for route in app.routes]
+        self.assertIn("/analyze", routes, "Expected /analyze route in orchestrator app")
+        self.assertIn("/a2a/analyze", routes, "Expected /a2a/analyze route in orchestrator app")
+
+
 if __name__ == "__main__":
     unittest.main()
