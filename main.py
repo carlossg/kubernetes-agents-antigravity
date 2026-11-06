@@ -65,6 +65,7 @@ if args.role == "orchestrator":
         log_model = ctx.get("logModel")
         metrics_model = ctx.get("metricsModel")
         event_model = ctx.get("eventModel")
+        decision_model = ctx.get("decisionModel")
 
         if not namespace or not rollout_name or not stable_selector or not canary_selector:
             raise HTTPException(
@@ -77,7 +78,8 @@ if args.role == "orchestrator":
                 model=model,
                 log_model=log_model,
                 metrics_model=metrics_model,
-                event_model=event_model
+                event_model=event_model,
+                decision_model=decision_model,
             )
             result = await orchestrator.analyze_rollout(
                 namespace=namespace,

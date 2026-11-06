@@ -10,6 +10,11 @@ from agents.logs import LogAnalystAgent, fetch_kubernetes_pod_logs
 from agents.log_proxy import get_first_pod_logs
 from agents.metrics import MetricsAnalystAgent, fetch_kubernetes_pod_metrics
 from agents.events import EventAnalystAgent, fetch_kubernetes_namespace_events
+from agents.decisions import (
+    build_rollout_questions,
+    evaluate_rollout_decisions,
+    parse_rollout_decisions,
+)
 from agents.orchestrator import LeadOrchestratorAgent
 
 # ----------------------------------------------------------------------
@@ -335,88 +340,237 @@ class TestSpecialistAgents(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report, expected_report)
 
 
+class TestDecisionsAPI(unittest.IsolatedAsyncioTestCase):
+
+    def test_build_rollout_questions_schema(self):
+        questions = build_rollout_questions()
+        self.assertEqual(
+            set(questions.keys()),
+            {
+                "promote",
+                "logs_healthy",
+                "metrics_healthy",
+                "events_healthy",
+                "code_bug",
+                "failure_category",
+                "severity",
+            },
+        )
+        self.assertEqual(questions["promote"]["type"], "noul")
+        self.assertEqual(questions["failure_category"]["type"], "choice")
+        self.assertEqual(questions["severity"]["type"], "score")
+
+    def test_parse_rollout_decisions_blocked_by_safety_filter(self):
+        blocked_payload = {
+            "prompt_feedback": {
+                "block_reason": "SAFETY",
+                "block_reason_message": "Blocked input",
+            }
+        }
+        decision = parse_rollout_decisions(blocked_payload)
+        self.assertFalse(decision.promote)
+        self.assertEqual(decision.confidence, 0)
+        self.assertFalse(decision.code_bug)
+        self.assertIn("blocked by safety filter", decision.voting_rationale.lower())
+
+    async def test_evaluate_rollout_decisions_rest_request(self):
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            captured["api_key"] = request.headers.get("x-goog-api-key")
+            captured["body"] = request.read().decode("utf-8")
+            return httpx.Response(
+                200,
+                json={
+                    "answers": {
+                        "promote": {"type": "noul", "noul": 0.95, "confidence": 0.95},
+                        "logs_healthy": {"type": "noul", "noul": 0.98, "confidence": 0.98},
+                        "metrics_healthy": {"type": "noul", "noul": 0.92, "confidence": 0.92},
+                        "events_healthy": {"type": "noul", "noul": 0.96, "confidence": 0.96},
+                        "code_bug": {"type": "noul", "noul": 0.02, "confidence": 0.98},
+                        "failure_category": {
+                            "type": "choice",
+                            "choice": "healthy",
+                            "probabilities": {
+                                "application_bug": 0.01,
+                                "healthy": 0.96,
+                                "infrastructure_event": 0.01,
+                                "other": 0.01,
+                                "resource_regression": 0.01,
+                            },
+                            "confidence": 0.96,
+                        },
+                        "severity": {
+                            "type": "score",
+                            "score": 0.05,
+                            "legend": {
+                                "0": "Healthy",
+                                "1": "Minor warning",
+                                "2": "Degraded",
+                                "3": "Critical failure",
+                            },
+                            "probabilities": {"0": 0.95, "1": 0.05, "2": 0.0, "3": 0.0},
+                            "confidence": 0.95,
+                        },
+                    }
+                },
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await evaluate_rollout_decisions(
+                rollout_name="canary-demo",
+                namespace="default",
+                logs_report="Logs clean",
+                metrics_report="Metrics normal",
+                events_report="Events normal",
+                api_key="test-key-123",
+                http_client=client,
+            )
+
+        self.assertEqual(captured["url"], "https://generativelanguage.googleapis.com/v1beta/decisions")
+        self.assertEqual(captured["api_key"], "test-key-123")
+        self.assertIn("gemini-decision-eap", captured["body"])
+        self.assertTrue(result.promote)
+        self.assertEqual(result.confidence, 95)
+        self.assertFalse(result.code_bug)
+        self.assertEqual(result.logs_decision.confidence_pct, 98)
+        self.assertEqual(result.metrics_decision.confidence_pct, 92)
+        self.assertEqual(result.events_decision.confidence_pct, 96)
+
+
 class TestLeadOrchestratorAgent(unittest.IsolatedAsyncioTestCase):
 
+    @patch("agents.orchestrator.evaluate_rollout_decisions")
     @patch("agents.orchestrator.Agent")
     @patch("agents.logs.LogAnalystAgent.analyze")
     @patch("agents.metrics.MetricsAnalystAgent.analyze")
     @patch("agents.events.EventAnalystAgent.analyze")
-    async def test_orchestrator_promote_consensus(self, mock_events, mock_metrics, mock_logs, mock_agent_class):
-        mock_logs.return_value = "Log report: Everything is healthy. promote: true"
-        mock_metrics.return_value = "Metrics report: Resource usage stable. promote: true"
-        mock_events.return_value = "Events report: No issues found. Healthy"
+    async def test_orchestrator_promote_skips_generative_agent(
+        self, mock_events, mock_metrics, mock_logs, mock_agent_class, mock_eval_decisions
+    ):
+        mock_logs.return_value = "Log report: Everything is healthy."
+        mock_metrics.return_value = "Metrics report: Resource usage stable."
+        mock_events.return_value = "Events report: No issues found."
 
-        debate_response = """
-        {
-            "promote": true,
-            "confidence": 95,
-            "analysis": "All three analysts reports are positive. Logs, metrics and events show a healthy deployment.",
-            "rootCause": "",
-            "remediation": "",
-            "votingRationale": "Consensus resolved positively. All subagents vote promote."
-        }
-        """
-        mock_agent_class.return_value = MockAgentInstance(debate_response)
+        mock_eval_decisions.return_value = parse_rollout_decisions(
+            {
+                "answers": {
+                    "promote": {"type": "noul", "noul": 0.95, "confidence": 0.95},
+                    "logs_healthy": {"type": "noul", "noul": 0.97, "confidence": 0.97},
+                    "metrics_healthy": {"type": "noul", "noul": 0.93, "confidence": 0.93},
+                    "events_healthy": {"type": "noul", "noul": 0.91, "confidence": 0.91},
+                    "code_bug": {"type": "noul", "noul": 0.02, "confidence": 0.98},
+                    "failure_category": {"type": "choice", "choice": "healthy", "confidence": 0.95},
+                    "severity": {
+                        "type": "score",
+                        "score": 0.04,
+                        "legend": {"0": "Healthy", "1": "Minor", "2": "Degraded", "3": "Critical"},
+                        "probabilities": {"0": 0.96, "1": 0.04, "2": 0.0, "3": 0.0},
+                        "confidence": 0.96,
+                    },
+                }
+            }
+        )
 
         orchestrator = LeadOrchestratorAgent(
             model="gemma-4-diffusion",
             log_model="gemma-4-diffusion",
             metrics_model="gemma-4-diffusion",
-            event_model="gemma-4-diffusion"
+            event_model="gemma-4-diffusion",
+            decision_model="gemini-decision-eap",
         )
         self.assertEqual(orchestrator.config.model, "gemma-4-diffusion")
         self.assertEqual(orchestrator.log_model, "gemma-4-diffusion")
+        self.assertEqual(orchestrator.decision_model, "gemini-decision-eap")
 
         result = await orchestrator.analyze_rollout(
             namespace="test-ns",
             rollout_name="test-rollout",
             stable_selector="app=test,role=stable",
-            canary_selector="app=test,role=canary"
+            canary_selector="app=test,role=canary",
         )
+
+        # Generative Agent must NOT be called when promote is True
+        mock_agent_class.assert_not_called()
 
         self.assertTrue(result["promote"])
         self.assertEqual(result["confidence"], 95)
+        self.assertEqual(result["rootCause"], "")
+        self.assertEqual(result["remediation"], "")
+        self.assertFalse(result["codeBug"])
         self.assertEqual(len(result["modelResults"]), 3)
-        self.assertTrue(result["modelResults"][0]["promote"]) # Log analyst promote: True
-        self.assertTrue(result["modelResults"][1]["promote"]) # Metrics analyst promote: True
-        self.assertTrue(result["modelResults"][2]["promote"]) # Event analyst promote: True
+        self.assertTrue(result["modelResults"][0]["promote"])
+        self.assertEqual(result["modelResults"][0]["confidence"], 97)
+        self.assertTrue(result["modelResults"][1]["promote"])
+        self.assertEqual(result["modelResults"][1]["confidence"], 93)
+        self.assertTrue(result["modelResults"][2]["promote"])
+        self.assertEqual(result["modelResults"][2]["confidence"], 91)
 
+    @patch("agents.orchestrator.evaluate_rollout_decisions")
     @patch("agents.orchestrator.Agent")
     @patch("agents.logs.LogAnalystAgent.analyze")
     @patch("agents.metrics.MetricsAnalystAgent.analyze")
     @patch("agents.events.EventAnalystAgent.analyze")
-    async def test_orchestrator_revert_consensus(self, mock_events, mock_metrics, mock_logs, mock_agent_class):
+    async def test_orchestrator_revert_calls_generative_agent_for_summary(
+        self, mock_events, mock_metrics, mock_logs, mock_agent_class, mock_eval_decisions
+    ):
         mock_logs.return_value = "Log report: Traceback observed. Failed."
         mock_metrics.return_value = "Metrics report: Memory usage high. Rollback."
         mock_events.return_value = "Events report: BackOff warnings. Fail."
 
-        debate_response = """
+        mock_eval_decisions.return_value = parse_rollout_decisions(
+            {
+                "answers": {
+                    "promote": {"type": "noul", "noul": 0.10, "confidence": 0.90},
+                    "logs_healthy": {"type": "noul", "noul": 0.08, "confidence": 0.92},
+                    "metrics_healthy": {"type": "noul", "noul": 0.12, "confidence": 0.88},
+                    "events_healthy": {"type": "noul", "noul": 0.15, "confidence": 0.85},
+                    "code_bug": {"type": "noul", "noul": 0.14, "confidence": 0.86},
+                    "failure_category": {"type": "choice", "choice": "resource_regression", "confidence": 0.89},
+                    "severity": {
+                        "type": "score",
+                        "score": 2.85,
+                        "legend": {"0": "Healthy", "1": "Minor", "2": "Degraded", "3": "Critical"},
+                        "probabilities": {"0": 0.0, "1": 0.0, "2": 0.15, "3": 0.85},
+                        "confidence": 0.85,
+                    },
+                }
+            }
+        )
+
+        abort_narrative = """
         {
-            "promote": false,
-            "confidence": 90,
             "analysis": "Severe failures detected across logs, metrics, and cluster events.",
             "rootCause": "Memory leak and crash loops",
-            "remediation": "Revert the rollout immediately and check heap memory usage",
-            "votingRationale": "Consensus resolved to rollback due to multi-signal failure."
+            "remediation": "Revert the rollout immediately and check heap memory usage"
         }
         """
-        mock_agent_class.return_value = MockAgentInstance(debate_response)
+        mock_agent_class.return_value = MockAgentInstance(abort_narrative)
 
         orchestrator = LeadOrchestratorAgent()
         result = await orchestrator.analyze_rollout(
             namespace="test-ns",
             rollout_name="test-rollout",
             stable_selector="app=test,role=stable",
-            canary_selector="app=test,role=canary"
+            canary_selector="app=test,role=canary",
         )
+
+        # Generative Agent IS called on abort to produce analysis/rootCause/remediation
+        mock_agent_class.assert_called_once()
 
         self.assertFalse(result["promote"])
         self.assertEqual(result["confidence"], 90)
         self.assertEqual(result["rootCause"], "Memory leak and crash loops")
+        self.assertFalse(result["codeBug"])
+        self.assertIn("Decisions API (ROLLBACK)", result["votingRationale"])
         self.assertEqual(len(result["modelResults"]), 3)
-        self.assertFalse(result["modelResults"][0]["promote"]) # Log analyst promote: False
-        self.assertFalse(result["modelResults"][1]["promote"]) # Metrics analyst promote: False
-        self.assertFalse(result["modelResults"][2]["promote"]) # Event analyst promote: False
+        self.assertFalse(result["modelResults"][0]["promote"])
+        self.assertEqual(result["modelResults"][0]["confidence"], 92)
+        self.assertFalse(result["modelResults"][1]["promote"])
+        self.assertEqual(result["modelResults"][1]["confidence"], 88)
+        self.assertFalse(result["modelResults"][2]["promote"])
+        self.assertEqual(result["modelResults"][2]["confidence"], 85)
 
 
 class TestOrchestratorEndpoints(unittest.TestCase):

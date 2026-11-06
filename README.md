@@ -93,7 +93,10 @@ sequenceDiagram
         Note over Events: Assess lifecycle issues
         Events-->>Orch: Recommendation & Vote
     end
-    Note over Orch: Synthesize reports & run Debate Prompt
+    Note over Orch: Interpret specialist reports via Gemini Decisions API (gemini-decision-eap)
+    alt Promote == False
+        Note over Orch: Synthesize human-readable analysis, rootCause, remediation
+    end
     Orch-->>Plugin: Return consensus JSON (promote, confidence, votingRationale)
 ```
 
@@ -104,8 +107,8 @@ sequenceDiagram
 The agent microservices run a single unified Docker container image, configured via CLI parameters at startup:
 
 1. **Lead Orchestrator (`--role orchestrator`)**
-   * Configured via [orchestrator.py](file:///Users/sanchezg/dev/carlossg/argo-rollouts/rollouts-plugin-metric-ai/kubernetes-agents-antigravity/agents/orchestrator.py).
-   * Orchestrates the specialist subagents. If the specialists return conflicting recommendations, it prompts Gemini to debate the reports and yield a final unified JSON consensus block.
+   * Configured via [orchestrator.py](file:///Users/sanchezg/dev/carlossg/argo-rollouts/rollouts-plugin-metric-ai/kubernetes-agents-antigravity/agents/orchestrator.py) and [decisions.py](file:///Users/sanchezg/dev/carlossg/argo-rollouts/rollouts-plugin-metric-ai/kubernetes-agents-antigravity/agents/decisions.py).
+   * Orchestrates the specialist subagents and sends their text reports in a single batched request to the **Gemini Decisions API** (`gemini-decision-eap` at `POST /v1beta/decisions`) to compute calibrated probabilities for `promote`, per-specialist health (`logs_healthy`, `metrics_healthy`, `events_healthy`), `code_bug`, `failure_category`, and `severity`. When a rollout is aborted, it uses the generative `Agent` to produce human-readable `analysis`, `rootCause`, and `remediation` fields.
 2. **Log Analyst (`--role logs`)**
    * Configured via [logs.py](file:///Users/sanchezg/dev/carlossg/argo-rollouts/rollouts-plugin-metric-ai/kubernetes-agents-antigravity/agents/logs.py).
    * Runs the `LogAnalystAgent` which calls `fetch_kubernetes_pod_logs` to analyze application log differences between stable and canary versions.
@@ -128,7 +131,7 @@ Set the GitHub token (needs `contents` and `pull requests` write access on the t
 kubectl create secret generic argo-rollouts-secret -n argo-rollouts \
   --from-literal=GITHUB_TOKEN=<token> --dry-run=client -o yaml | kubectl apply -f -
 ```
-Models are pinned in `k8s/agents.yaml` via `*_AGENT_MODEL` env vars: `gemini-3.8-flash` for the log, metrics and event analysts, `gemini-4-argon` for the orchestrator consensus and remediation agent.
+Models are pinned in `k8s/agents.yaml` via `*_AGENT_MODEL` env vars: `gemini-3.8-flash` for the log, metrics and event analysts, `gemini-decision-eap` for the orchestrator's calibrated Decisions API evaluation, and `gemini-4-argon` for abort narrative synthesis and the remediation agent.
 
 The variable is optional: without it remediation is skipped and a `REMEDIATION` event says so. Remediation runs in the background so the verdict is returned immediately; the PR and issue URLs are published to the activity feed.
 

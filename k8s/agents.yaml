@@ -228,6 +228,8 @@ spec:
           env:
             - name: ORCHESTRATOR_AGENT_MODEL
               value: gemini-4-argon
+            - name: DECISION_AGENT_MODEL
+              value: gemini-decision-eap
             - name: REMEDIATION_AGENT_MODEL
               value: gemini-4-argon
             - name: EVENTS_AGENT_MODEL

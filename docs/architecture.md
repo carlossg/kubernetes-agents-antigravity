@@ -36,7 +36,7 @@ graph TB
         MS["Metrics Server"]
     end
 
-    Gemini["Gemini API<br/>gemini-3.8-flash: specialists<br/>gemini-4-argon: orchestrator + remediation"]
+    Gemini["Gemini API<br/>gemini-3.8-flash: specialists<br/>gemini-decision-eap: Decisions API<br/>gemini-4-argon: abort summary + remediation"]
     GH["GitHub<br/>remediation PR + issue labeled jules"]
     Jules["Jules<br/>opens a PR for the issue"]
 
@@ -74,7 +74,7 @@ graph TB
 
 1. An Argo Rollouts `AnalysisRun` calls the metric AI plugin, which calls `POST /a2a/analyze` on the orchestrator.
 2. The orchestrator calls the three specialists in parallel. The Log Analyst fetches logs through the Log Proxy.
-3. The specialists' reports go into a consensus debate, which produces the verdict (promote or abort) and a `codeBug` flag.
+3. The specialists' reports are evaluated in one batched request by the Gemini Decisions API (`gemini-decision-eap`), which produces calibrated probabilities for the verdict (`promote`), per-specialist votes, `failure_category`, `severity`, and `codeBug`. If the rollout is aborted, the orchestrator calls the generative `Agent` to write the human-readable `analysis`, `rootCause`, and `remediation` fields.
 4. The verdict returns to the plugin immediately, so the rollout can abort without waiting.
 5. If `codeBug` is set, remediation runs in the background (150s timeout): it opens a PR and a `jules` issue, and Jules then opens its own PR.
 6. Every step is emitted as an activity event. The dashboard polls `/a2a/events` and shows them live.
