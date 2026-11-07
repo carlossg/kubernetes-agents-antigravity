@@ -10,5 +10,5 @@ resources:
 images:
   - name: kubernetes-agents-antigravity
     newName: ghcr.io/carlossg/kubernetes-agents-antigravity
-    newTag: 0.1.0
-    digest: sha256:06675bc4bf11be6856c9af42352e8723fc68c14bc6386b4121700b3fcaa3276e
+    newTag: feat-decisions-api
+    digest: sha256:7a9d2bfe05c2a7590e39117742be4168f9a1e23fe31c58513324a31fad43d70a
