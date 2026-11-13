@@ -1,229 +1,138 @@
-"""Remediation: turn a code-bug root cause into a GitHub pull request.
-
-Only invoked by the orchestrator when the consensus verdict is "do not promote"
-AND the root cause is a bug in application source code (a stack trace pointing
-into the repo). Operational problems such as memory leaks are left alone.
-
-Flow: a RemediationAgent explores the repo through read-only tools, returns the
-fixed file as JSON, and plain code (not the LLM) creates the branch, commit and
-pull request through the GitHub REST API.
-"""
-import base64
-import json
+"""Delegate the final rollback to a separate sandboxed remediation service over A2A."""
+import asyncio
 import os
 import re
 import uuid
-from urllib.parse import urlparse
 
 import httpx
-from google.antigravity import Agent, LocalAgentConfig
 
 from agents import activity
+from agents.contracts import RemediationRequest, RemediationResponse
 
-GITHUB_API = "https://api.github.com"
-MAX_FILE_CHARS = 60_000
-MAX_LISTED_FILES = 40
-
-
-def parse_repo_url(repo_url: str) -> tuple[str, str]:
-    """Extract (owner, repo) from https://github.com/owner/repo[.git]."""
-    parts = [p for p in urlparse(repo_url).path.split("/") if p]
-    if len(parts) < 2:
-        raise ValueError(f"Not a GitHub repository URL: {repo_url}")
-    return parts[0], re.sub(r"\.git$", "", parts[1])
+_background_tasks: set[asyncio.Task] = set()
+FAILED_STATUSES = {"tests_failed", "agent_error", "rejected", "timeout", "infra_error", "pr_failed"}
 
 
-class GitHubRepo:
-    def __init__(self, repo_url: str, token: str, base_branch: str = "main", client: httpx.Client | None = None):
-        self.owner, self.repo = parse_repo_url(repo_url)
-        self.base_branch = base_branch or "main"
-        self._http = client or httpx.Client(
-            base_url=GITHUB_API,
-            timeout=30.0,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
+def parse_artifact(result: dict) -> RemediationResponse:
+    if result.get("kind") == "message":
+        parts = result.get("parts", [])
+    else:
+        artifacts = result.get("artifacts")
+        if not isinstance(artifacts, list) or any(
+            not isinstance(a, dict) or not isinstance(a.get("parts"), list) for a in artifacts
+        ):
+            raise ValueError("Invalid A2A artifacts")
+        parts = [p for a in artifacts for p in a["parts"]]
+    if not isinstance(parts, list) or any(
+        not isinstance(p, dict) or not isinstance(p.get("text", ""), str) for p in parts
+    ):
+        raise ValueError("Invalid A2A text parts")
+    text = "".join(p.get("text", "") for p in parts if p.get("kind") == "text")
+    response = RemediationResponse.model_validate_json(text)
+    if response.status == "success" and not response.prLink:
+        raise ValueError("Successful remediation did not return a PR")
+    if response.status == "issue" and not response.issueLink:
+        raise ValueError("Issue remediation did not return an issue")
+    for link in (response.prLink, response.issueLink):
+        if link and not re.fullmatch(r"https://github\.com/[^/\s]+/[^/\s]+/(pull|issues)/[1-9][0-9]*", link):
+            raise ValueError("Invalid remediation artifact URL")
+    return response
+
+
+async def call_remediation(
+    request: RemediationRequest, url: str, http_client: httpx.AsyncClient | None = None,
+) -> RemediationResponse:
+    async def run(http):
+        async def rpc(method: str, params: dict):
+            request_id = str(uuid.uuid4())
+            headers = {}
+            token = os.getenv("REMEDIATION_AGENT_TOKEN")
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            response = await http.post(url, headers=headers, json={
+                "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
+            })
+            response.raise_for_status()
+            payload = response.json()
+            if (not isinstance(payload, dict) or payload.get("jsonrpc") != "2.0"
+                    or payload.get("id") != request_id):
+                raise ValueError("Invalid A2A JSON-RPC response")
+            if payload.get("error"):
+                raise ValueError(f"A2A error: {payload['error']}")
+            result = payload.get("result")
+            if not isinstance(result, dict):
+                raise ValueError("Missing A2A result")
+            return result
+
+        result = await rpc("message/send", {
+            "message": {
+                "kind": "message", "messageId": str(uuid.uuid4()), "role": "user",
+                "parts": [{"kind": "text", "text": request.model_dump_json()}],
             },
-        )
-        self._paths: list[str] | None = None
+            "configuration": {"blocking": True, "acceptedOutputModes": ["text/plain", "application/json"]},
+        })
+        while result.get("kind") == "task":
+            status = result.get("status")
+            if not isinstance(status, dict):
+                raise ValueError("Missing A2A task status")
+            state = status.get("state")
+            if state == "completed":
+                break
+            if state not in {"submitted", "working"} or not result.get("id"):
+                raise ValueError(f"Remediation task did not complete: {state}")
+            await asyncio.sleep(2)
+            result = await rpc("tasks/get", {"id": result["id"]})
+        if result.get("kind") not in {"task", "message"}:
+            raise ValueError("Invalid A2A result kind")
+        return parse_artifact(result)
 
-    @property
-    def _slug(self) -> str:
-        return f"/repos/{self.owner}/{self.repo}"
-
-    def _request(self, method: str, path: str, **kwargs) -> dict:
-        resp = self._http.request(method, f"{self._slug}{path}", **kwargs)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"GitHub {method} {path} -> {resp.status_code}: {resp.text[:300]}")
-        return resp.json()
-
-    def list_paths(self) -> list[str]:
-        if self._paths is None:
-            tree = self._request("GET", f"/git/trees/{self.base_branch}", params={"recursive": "1"})
-            self._paths = [e["path"] for e in tree.get("tree", []) if e["type"] == "blob"]
-        return self._paths
-
-    def find_files(self, name_fragment: str) -> list[str]:
-        needle = name_fragment.lower()
-        return [p for p in self.list_paths() if needle in p.lower()][:MAX_LISTED_FILES]
-
-    def read_file(self, path: str) -> str:
-        data = self._request("GET", f"/contents/{path}", params={"ref": self.base_branch})
-        return base64.b64decode(data["content"]).decode("utf-8")
-
-    def create_pull_request(self, path: str, new_content: str, title: str, body: str, branch: str) -> str:
-        base_sha = self._request("GET", f"/git/ref/heads/{self.base_branch}")["object"]["sha"]
-        self._request("POST", "/git/refs", json={"ref": f"refs/heads/{branch}", "sha": base_sha})
-        current = self._request("GET", f"/contents/{path}", params={"ref": branch})
-        self._request(
-            "PUT",
-            f"/contents/{path}",
-            json={
-                "message": title,
-                "content": base64.b64encode(new_content.encode("utf-8")).decode("ascii"),
-                "sha": current["sha"],
-                "branch": branch,
-            },
-        )
-        pr = self._request(
-            "POST",
-            "/pulls",
-            json={"title": title, "head": branch, "base": self.base_branch, "body": body},
-        )
-        return pr["html_url"]
-
-    def create_issue(self, title: str, body: str, labels: list[str]) -> str:
-        issue = self._request("POST", "/issues", json={"title": title, "body": body, "labels": labels})
-        return issue["html_url"]
+    timeout = float(os.getenv("REMEDIATION_TIMEOUT_SECONDS", "2100"))
+    if not 0 < timeout <= 2100:
+        raise ValueError("Invalid REMEDIATION_TIMEOUT_SECONDS")
+    async with asyncio.timeout(timeout):
+        if http_client is not None:
+            return await run(http_client)
+        async with httpx.AsyncClient(timeout=timeout) as http:
+            return await run(http)
 
 
-ISSUE_LABEL = "jules"
-
-
-def extract_json(text: str) -> dict:
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    return json.loads(match.group(0) if match else text)
-
-
-def _make_tools(gh: GitHubRepo):
-    def find_repo_files(name_fragment: str) -> str:
-        """
-        Lists repository file paths whose path contains the given fragment (case-insensitive).
-        Use the class or file name from a stack trace, e.g. 'MetricsResource'.
-
-        Args:
-            name_fragment: Part of a file path or file name to search for.
-        """
-        activity.feed.emit(activity.TOOL_CALL, "find_repo_files", name_fragment)
-        try:
-            matches = gh.find_files(name_fragment)
-        except Exception as e:
-            return f"Failed to list repository files: {e}"
-        result = "\n".join(matches) if matches else "No matching files"
-        activity.feed.emit(activity.TOOL_RESULT, "find_repo_files", result[:500])
-        return result
-
-    def read_repo_file(path: str) -> str:
-        """
-        Reads a file from the repository's base branch and returns its full content.
-
-        Args:
-            path: Repository-relative file path, e.g. 'src/main/java/Foo.java'.
-        """
-        activity.feed.emit(activity.TOOL_CALL, "read_repo_file", path)
-        try:
-            content = gh.read_file(path)
-        except Exception as e:
-            return f"Failed to read {path}: {e}"
-        activity.feed.emit(activity.TOOL_RESULT, "read_repo_file", f"{path} ({len(content)} chars)")
-        return content[:MAX_FILE_CHARS]
-
-    return [find_repo_files, read_repo_file]
+async def _run(request: RemediationRequest, url: str):
+    activity.feed.emit(activity.AGENT_START, "RemediationAgent", request.issueCategory)
+    try:
+        result = await call_remediation(request, url)
+        if result.status in FAILED_STATUSES:
+            activity.feed.emit(activity.ERROR, "Remediation failed",
+                               f"{result.status}: {result.message or ''}")
+        else:
+            activity.feed.emit(activity.REMEDIATION, f"Remediation {result.status}",
+                               result.prLink or result.issueLink or result.message or "")
+    except (httpx.HTTPError, ValueError, TimeoutError) as exc:
+        activity.feed.emit(activity.ERROR, "A2A remediation failed", str(exc))
+    finally:
+        activity.feed.emit(activity.AGENT_COMPLETE, "RemediationAgent")
 
 
 class RemediationAgent:
-    def __init__(self, model: str | None = None):
-        self.model = model or os.getenv("REMEDIATION_AGENT_MODEL")
-
-    async def propose_fix(self, gh: GitHubRepo, rollout_name: str, root_cause: str, logs_report: str) -> dict:
-        config = LocalAgentConfig(
-            system_instructions=(
-                "You are a Remediation Agent. A canary deployment was rejected because of a bug in the "
-                "application source code. Locate the offending source file in the GitHub repository using the "
-                "tools 'find_repo_files' and 'read_repo_file', then fix the bug with the smallest possible change: keep the existing structure, flags, logging and behavior, and only add the missing guard or correction (for example a null check). Never delete or rewrite surrounding code, and keep the diff to a few lines. "
-                "Do NOT use any other tool, do not run commands, and do not read local files. "
-                "Be efficient: use at most one find_repo_files call and read only the single most relevant file.\n\n"
-                "Respond ONLY with a single JSON object with these fields:\n"
-                '{"path": "repository-relative path of the file you fixed",\n'
-                ' "newContent": "the COMPLETE new content of that file",\n'
-                ' "title": "short pull request title",\n'
-                ' "summary": "what was wrong and what you changed"}\n'
-                "If you cannot confidently fix the bug, respond with {\"path\": null}."
-            ),
-            tools=_make_tools(gh),
-            model=self.model,
-        )
-        prompt = (
-            f"Rollout '{rollout_name}' canary failed with this root cause:\n{root_cause}\n\n"
-            f"Relevant log analysis:\n{logs_report}\n\n"
-            "Find the source file, fix the bug, and return the JSON object."
-        )
-        async with Agent(config) as agent:
-            response = await agent.chat(prompt)
-            return extract_json(await response.text())
-
-
-async def remediate(
-    repo_url: str,
-    base_branch: str,
-    rollout_name: str,
-    namespace: str,
-    root_cause: str,
-    logs_report: str,
-    analysis: str,
-    model: str | None = None,
-) -> str | None:
-    """Open a fix PR and return its URL, or None when remediation is skipped."""
-    token = os.getenv("GITHUB_TOKEN")
-    if not token:
-        activity.feed.emit(activity.REMEDIATION, "Skipped: GITHUB_TOKEN is not configured")
-        return None
-
-    activity.feed.emit(activity.AGENT_START, "RemediationAgent", f"Investigating {repo_url}")
-    try:
-        gh = GitHubRepo(repo_url, token, base_branch)
-        fix = await RemediationAgent(model=model).propose_fix(gh, rollout_name, root_cause, logs_report)
-        path = fix.get("path")
-        if not path or not fix.get("newContent"):
-            activity.feed.emit(activity.REMEDIATION, "No confident fix found", root_cause)
-            return None
-
-        branch = f"fix/rollout-{rollout_name}-{uuid.uuid4().hex[:8]}"
-        title = f"Fix: {fix.get('title') or root_cause[:80]}"
-        body = (
-            f"Automated fix proposed by the Kubernetes AI/Ops agents after canary rollout "
-            f"`{namespace}/{rollout_name}` was rejected.\n\n"
-            f"**Root cause**\n{root_cause}\n\n**Change**\n{fix.get('summary', '')}\n\n"
-            f"**Analysis**\n{analysis}"
-        )
-        pr_url = gh.create_pull_request(path, fix["newContent"], title, body, branch)
-        activity.feed.emit(activity.REMEDIATION, f"Pull request created: {title}", pr_url)
-
-        # The PR is already open; an issue failure must not discard it.
+    def delegate(self, request: RemediationRequest):
+        url = os.getenv("REMEDIATION_AGENT_URL", "").strip()
+        if not url:
+            activity.feed.emit(activity.REMEDIATION, "Skipped: REMEDIATION_AGENT_URL is not configured")
+            return
         try:
-            issue_body = (
-                f"Canary rollout `{namespace}/{rollout_name}` was rejected.\n\n"
-                f"**Root cause**\n{root_cause}\n\n**Proposed fix**: {pr_url}\n\n"
-                f"**Analysis**\n{analysis}"
-            )
-            issue_url = gh.create_issue(title, issue_body, [ISSUE_LABEL])
-            activity.feed.emit(activity.REMEDIATION, f"Issue created (label '{ISSUE_LABEL}'): {title}", issue_url)
-        except Exception as e:
-            activity.feed.emit(activity.ERROR, "Issue creation failed", str(e))
+            parsed = httpx.URL(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.host:
+                raise ValueError("REMEDIATION_AGENT_URL must be an HTTP(S) A2A JSON-RPC endpoint")
+        except (ValueError, httpx.InvalidURL) as exc:
+            activity.feed.emit(activity.ERROR, "Remediation endpoint is invalid", str(exc))
+            return
+        activity.feed.emit(activity.REMEDIATION, "Delegating final rollback", request.issueCategory)
+        task = asyncio.create_task(_run(request, url))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
-        activity.feed.emit(activity.AGENT_COMPLETE, "RemediationAgent", pr_url)
-        return pr_url
-    except Exception as e:
-        activity.feed.emit(activity.ERROR, "Remediation failed", str(e))
-        return None
+
+async def shutdown():
+    tasks = list(_background_tasks)
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)

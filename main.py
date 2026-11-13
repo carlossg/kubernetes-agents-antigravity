@@ -1,172 +1,119 @@
 import argparse
+import asyncio
+from contextlib import asynccontextmanager
+from typing import Any
+
+import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import Optional, Dict, Any
-from agents.orchestrator import LeadOrchestratorAgent
-from agents.logs import LogAnalystAgent
-from agents.metrics import MetricsAnalystAgent
+from kubernetes import client
+from kubernetes.config.config_exception import ConfigException
+from pydantic import BaseModel, ValidationError
+
+from agents import activity, remediation
+from agents.contracts import AnalysisContext
 from agents.events import EventAnalystAgent
-from agents import activity
+from agents.logs import LogAnalystAgent
+from agents.metrics import MetricsDataAgent
+from agents.orchestrator import LeadOrchestratorAgent
 
-# Define CLI argument parser
-parser = argparse.ArgumentParser(description="Kubernetes AI/Ops Agent - Google Antigravity SDK")
-parser.add_argument(
-    "--role",
-    choices=["orchestrator", "logs", "metrics", "events", "log-proxy"],
-    default="orchestrator",
-    help="Role of this agent microservice instance (default: orchestrator)"
-)
-parser.add_argument("--host", default="0.0.0.0", help="HTTP server host")
-parser.add_argument("--port", type=int, default=8080, help="HTTP server port")
-args, _ = parser.parse_known_args()
 
-app = FastAPI(title=f"Kubernetes AI/Ops Agent ({args.role}) - Google Antigravity SDK")
-
-# Define Pydantic request models
 class A2ARequest(BaseModel):
     userId: str
     prompt: str
-    context: Dict[str, Any]
-    memoryId: Optional[str] = None
+    context: dict[str, Any]
+    memoryId: str | None = None
+
 
 class SpecialistRequest(BaseModel):
     namespace: str
     stableSelector: str
     canarySelector: str
-    extraPrompt: Optional[str] = ""
-    model: Optional[str] = None
+    extraPrompt: str = ""
 
-@app.get("/")
-def health_check():
-    """Simple health check endpoint."""
-    return {"status": "healthy", "service": "kubernetes-agents-antigravity", "role": args.role}
 
-# Define endpoints based on CLI role
-if args.role == "orchestrator":
-    @app.post("/analyze")
-    @app.post("/a2a/analyze")
-    async def analyze_canary(request: A2ARequest):
-        """
-        Agent-to-Agent endpoint triggered by the Argo Rollouts AI metric plugin.
-        Delegates analysis to the specialized agents.
-        """
-        ctx = request.context
-        namespace = ctx.get("namespace")
-        rollout_name = ctx.get("rolloutName")
-        stable_selector = ctx.get("stableSelector")
-        canary_selector = ctx.get("canarySelector")
-        extra_prompt = ctx.get("extraPrompt", "")
-        repo_url = ctx.get("repoUrl", "")
-        base_branch = ctx.get("baseBranch") or "main"
+@asynccontextmanager
+async def lifespan(app):
+    yield
+    await remediation.shutdown()
 
-        # Extract optional model configurations from the request context
-        model = ctx.get("model")
-        log_model = ctx.get("logModel")
-        metrics_model = ctx.get("metricsModel")
-        event_model = ctx.get("eventModel")
-        decision_model = ctx.get("decisionModel")
 
-        if not namespace or not rollout_name or not stable_selector or not canary_selector:
-            raise HTTPException(
-                status_code=400,
-                detail="Missing required context fields (namespace, rolloutName, stableSelector, canarySelector)"
-            )
+def create_app(role: str = "orchestrator") -> FastAPI:
+    app = FastAPI(title=f"Kubernetes AI/Ops Agent ({role})", lifespan=lifespan)
 
-        try:
-            orchestrator = LeadOrchestratorAgent(
-                model=model,
-                log_model=log_model,
-                metrics_model=metrics_model,
-                event_model=event_model,
-                decision_model=decision_model,
-            )
-            result = await orchestrator.analyze_rollout(
-                namespace=namespace,
-                rollout_name=rollout_name,
-                stable_selector=stable_selector,
-                canary_selector=canary_selector,
-                extra_prompt=extra_prompt,
-                repo_url=repo_url,
-                base_branch=base_branch
-            )
-            return result
-        except Exception as e:
-            activity.feed.emit(activity.ERROR, "Orchestrator error", str(e))
-            raise HTTPException(status_code=500, detail=f"Internal orchestrator error: {str(e)}")
+    @app.get("/")
+    def health_check():
+        return {"status": "healthy", "service": "kubernetes-agents-antigravity", "role": role}
 
-    @app.get("/events")
-    @app.get("/a2a/events")
-    def activity_events(since: Optional[int] = None):
-        """Activity feed polled by the quarkus-demo dashboard."""
-        return activity.feed.events(since)
+    if role == "orchestrator":
+        @app.post("/analyze")
+        @app.post("/a2a/analyze")
+        async def analyze_canary(request: A2ARequest):
+            try:
+                ctx = AnalysisContext.model_validate(request.context)
+            except ValidationError as exc:
+                raise HTTPException(status_code=400, detail=exc.errors(include_input=False)) from exc
+            try:
+                orchestrator = LeadOrchestratorAgent(
+                    model=ctx.model, decision_model=ctx.decisionModel,
+                    second_opinion_model=ctx.secondOpinionModel,
+                )
+                async with asyncio.timeout(270):
+                    return await orchestrator.analyze_rollout(
+                        namespace=ctx.namespace, rollout_name=ctx.rolloutName,
+                        stable_selector=ctx.stableSelector, canary_selector=ctx.canarySelector,
+                        extra_prompt=ctx.extraPrompt, repo_url=ctx.repoUrl, base_branch=ctx.baseBranch,
+                        pause_on_uncertainty=ctx.pauseOnUncertainty,
+                        uncertainty_threshold=ctx.uncertaintyThreshold, prompt=request.prompt,
+                    )
+            except (httpx.HTTPError, ValueError, RuntimeError, TimeoutError,
+                    client.ApiException, ConfigException, OSError) as exc:
+                activity.feed.emit(activity.ERROR, "Orchestrator error", str(exc))
+                raise HTTPException(status_code=500, detail="Analysis failed; see activity feed") from exc
 
-elif args.role == "logs":
-    @app.post("/analyze/logs")
-    async def analyze_logs(request: SpecialistRequest):
-        """Analyze logs and return a text report."""
-        try:
-            agent = LogAnalystAgent(model=request.model)
-            report = await agent.analyze(
-                namespace=request.namespace,
-                stable_selector=request.stableSelector,
-                canary_selector=request.canarySelector,
-                extra_prompt=request.extraPrompt
-            )
-            return {"analysis": report}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Logs analysis error: {str(e)}")
+        @app.get("/events")
+        @app.get("/a2a/events")
+        def activity_events(since: int | None = None):
+            return activity.feed.events(since)
 
-elif args.role == "metrics":
-    @app.post("/analyze/metrics")
-    async def analyze_metrics(request: SpecialistRequest):
-        """Analyze pod resource metrics and return a text report."""
-        try:
-            agent = MetricsAnalystAgent(model=request.model)
-            report = await agent.analyze(
-                namespace=request.namespace,
-                stable_selector=request.stableSelector,
-                canary_selector=request.canarySelector,
-                extra_prompt=request.extraPrompt
-            )
-            return {"analysis": report}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Metrics analysis error: {str(e)}")
+    elif role in {"logs", "metrics", "events"}:
+        collectors = {"logs": LogAnalystAgent, "metrics": MetricsDataAgent, "events": EventAnalystAgent}
 
-elif args.role == "events":
-    @app.post("/analyze/events")
-    async def analyze_events(request: SpecialistRequest):
-        """Analyze namespace events and return a text report."""
-        try:
-            agent = EventAnalystAgent(model=request.model)
-            report = await agent.analyze(
-                namespace=request.namespace,
-                stable_selector=request.stableSelector,
-                canary_selector=request.canarySelector,
-                extra_prompt=request.extraPrompt
-            )
-            return {"analysis": report}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Events analysis error: {str(e)}")
+        @app.post(f"/analyze/{role}")
+        async def collect(request: SpecialistRequest):
+            try:
+                report = await collectors[role]().collect(
+                    request.namespace, request.stableSelector, request.canarySelector,
+                )
+                return {"analysis": report.text(), "evidence": report.model_dump()}
+            except (httpx.HTTPError, ValueError, client.ApiException, ConfigException, OSError) as exc:
+                activity.feed.emit(activity.ERROR, f"{role} collection error", str(exc))
+                raise HTTPException(status_code=500, detail=f"{role} collection failed") from exc
 
-elif args.role == "log-proxy":
-    from agents.log_proxy import get_first_pod_logs
+    elif role == "log-proxy":
+        from agents.log_proxy import get_first_pod_logs
 
-    @app.get("/pod-logs")
-    def pod_logs(namespace: str, label_selector: str):
-        """Trusted in-cluster proxy for fetching pod logs.
+        @app.get("/pod-logs")
+        def pod_logs(namespace: str, label_selector: str):
+            try:
+                return {"logs": get_first_pod_logs(namespace, label_selector)}
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except (client.ApiException, ConfigException, OSError) as exc:
+                activity.feed.emit(activity.ERROR, "Log proxy error", str(exc))
+                raise HTTPException(status_code=500, detail="Log proxy failed") from exc
+    else:
+        raise ValueError(f"Unknown role: {role}")
+    return app
 
-        The Log Analyst agent runs in a gVisor Sandbox that cannot mount a
-        service account token (cluster security policy), so it calls this
-        service - which holds the credentials - instead of the K8s API directly.
-        """
-        try:
-            return {"logs": get_first_pod_logs(namespace, label_selector)}
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Log proxy error: {str(e)}")
 
+app = create_app()
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=args.host, port=args.port)
+    parser = argparse.ArgumentParser(description="Kubernetes AI/Ops Agent - Gemini")
+    parser.add_argument("--role", choices=["orchestrator", "logs", "metrics", "events", "log-proxy"],
+                        default="orchestrator")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8080)
+    args = parser.parse_args()
+    uvicorn.run(create_app(args.role), host=args.host, port=args.port)
