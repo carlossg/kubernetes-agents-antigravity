@@ -3,6 +3,7 @@ __pycache__/
 *.log
 .env
 .claude/settings.local.json
+.substrate-tools/
 
 # Regenerable build-demo intermediates (see demo-recording/build-demo/build.py)
 demo-recording/.venv/
