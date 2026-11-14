@@ -16,6 +16,7 @@ fi
 kubectl get sandboxconfig gvisor-default >/dev/null
 sed "s|kubernetes-agents-antigravity:latest|${ACTOR_IMAGE}|g" \
     "${ROOT}/k8s/log-analyst-substrate.yaml" | kubectl apply -f -
+kubectl wait --for=create deployment/kubernetes-agent-logs -n argo-rollouts --timeout=3m
 kubectl rollout status deployment/kubernetes-agent-logs -n argo-rollouts --timeout=10m
 if ! ate get atespace argo-rollouts >/dev/null 2>&1; then
     ate create atespace argo-rollouts
