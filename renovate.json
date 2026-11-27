@@ -8,16 +8,18 @@
   "platformAutomerge": true,
   "packageRules": [
     {
-      "description": "Automerge GitHub Actions minor, patch, and digest updates",
+      "description": "Keep major updates as manual PRs (except GitHub Actions)",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "Automerge all GitHub Actions updates",
       "matchManagers": [
         "github-actions"
       ],
-      "matchUpdateTypes": [
-        "minor",
-        "patch",
-        "digest"
-      ],
-      "groupName": "github-actions (non-major)",
+      "groupName": "github-actions",
       "automerge": true
     },
     {
@@ -42,13 +44,6 @@
         "digest"
       ],
       "automerge": true
-    },
-    {
-      "description": "Keep all major updates as manual PRs",
-      "matchUpdateTypes": [
-        "major"
-      ],
-      "automerge": false
     }
   ]
 }
