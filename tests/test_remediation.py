@@ -49,7 +49,8 @@ class RemediationTests(unittest.IsolatedAsyncioTestCase):
             calls.append(payload)
             result = (
                 {"task": {"id": "task-1", "status": {"state": "TASK_STATE_WORKING"}}}
-                if payload["method"] == "SendMessage" else artifact()
+                if payload["method"] == "SendMessage"
+                else artifact()["task"]
             )
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "result": result})
 

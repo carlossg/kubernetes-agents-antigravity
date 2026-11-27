@@ -84,7 +84,9 @@ async def call_remediation(
         def _unwrap_task(res: dict) -> dict | None:
             if isinstance(res.get("task"), dict):
                 return res["task"]
-            if res.get("kind") == "task":
+            if res.get("kind") == "task" or (
+                isinstance(res.get("status"), dict) and "state" in res["status"] and "id" in res
+            ):
                 return res
             return None
 
