@@ -7,7 +7,7 @@ install:
 	.venv/bin/pip install -r requirements.txt
 
 test:
-	PYTHONPATH=. .venv/bin/python -m unittest tests/test_agents.py
+	PYTHONPATH=. .venv/bin/python -m unittest discover -s tests -v
 
 run-orchestrator:
 	PYTHONPATH=. .venv/bin/python main.py --role orchestrator

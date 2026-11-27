@@ -1,17 +1,51 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: kubernetes-agents-sa
+  name: kubernetes-log-proxy-sa
   namespace: argo-rollouts
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: kubernetes-agents-role
+  name: kubernetes-log-proxy-role
 rules:
   - apiGroups: [""]
-    resources: ["pods", "pods/log", "events"]
+    resources: ["pods"]
     verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubernetes-log-proxy-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubernetes-log-proxy-role
+subjects:
+  - kind: ServiceAccount
+    name: kubernetes-log-proxy-sa
+    namespace: argo-rollouts
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubernetes-metrics-sa
+  namespace: argo-rollouts
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubernetes-metrics-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/proxy"]
+    verbs: ["get"]
   - apiGroups: ["metrics.k8s.io"]
     resources: ["pods"]
     verbs: ["get", "list"]
@@ -19,14 +53,70 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: kubernetes-agents-rolebinding
+  name: kubernetes-metrics-rolebinding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: kubernetes-agents-role
+  name: kubernetes-metrics-role
 subjects:
   - kind: ServiceAccount
-    name: kubernetes-agents-sa
+    name: kubernetes-metrics-sa
+    namespace: argo-rollouts
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubernetes-events-sa
+  namespace: argo-rollouts
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubernetes-events-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubernetes-events-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubernetes-events-role
+subjects:
+  - kind: ServiceAccount
+    name: kubernetes-events-sa
+    namespace: argo-rollouts
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubernetes-orchestrator-sa
+  namespace: argo-rollouts
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubernetes-orchestrator-role
+rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["rollouts"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubernetes-orchestrator-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubernetes-orchestrator-role
+subjects:
+  - kind: ServiceAccount
+    name: kubernetes-orchestrator-sa
     namespace: argo-rollouts
 ---
 # -----------------------------------------------------------------------------
@@ -79,7 +169,7 @@ spec:
       labels:
         app: kubernetes-agent-log-proxy
     spec:
-      serviceAccountName: kubernetes-agents-sa
+      serviceAccountName: kubernetes-log-proxy-sa
       containers:
         - name: agent
           image: kubernetes-agents-antigravity:latest
@@ -125,20 +215,23 @@ spec:
       labels:
         app: kubernetes-agent-metrics
     spec:
-      serviceAccountName: kubernetes-agents-sa
+      serviceAccountName: kubernetes-metrics-sa
       containers:
         - name: agent
           image: kubernetes-agents-antigravity:latest
           imagePullPolicy: Always
           args: ["--role", "metrics"]
           env:
-            - name: METRICS_AGENT_MODEL
-              value: gemini-3.8-flash
-            - name: GEMINI_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: argo-rollouts-secret
-                  key: GEMINI_API_KEY
+            - name: ANALYSIS_MIN_CANARY_REQUESTS
+              value: "500"
+            - name: ANALYSIS_SAMPLE_WINDOW_SECONDS
+              value: "10"
+            - name: ANALYSIS_MAX_SAMPLE_WAITS
+              value: "3"
+            - name: APPLICATION_METRICS_PORT
+              value: "8080"
+            - name: APPLICATION_METRICS_PATH
+              value: "/q/metrics"
           ports:
             - containerPort: 8080
 ---
@@ -172,20 +265,12 @@ spec:
       labels:
         app: kubernetes-agent-events
     spec:
-      serviceAccountName: kubernetes-agents-sa
+      serviceAccountName: kubernetes-events-sa
       containers:
         - name: agent
           image: kubernetes-agents-antigravity:latest
           imagePullPolicy: Always
           args: ["--role", "events"]
-          env:
-            - name: EVENTS_AGENT_MODEL
-              value: gemini-3.8-flash
-            - name: GEMINI_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: argo-rollouts-secret
-                  key: GEMINI_API_KEY
           ports:
             - containerPort: 8080
 ---
@@ -219,35 +304,32 @@ spec:
       labels:
         app: kubernetes-agent-orchestrator
     spec:
-      serviceAccountName: kubernetes-agents-sa
+      serviceAccountName: kubernetes-orchestrator-sa
       containers:
         - name: agent
           image: kubernetes-agents-antigravity:latest
           imagePullPolicy: Always
           args: ["--role", "orchestrator"]
           env:
-            - name: ORCHESTRATOR_AGENT_MODEL
-              value: gemini-4-argon
-            - name: REMEDIATION_AGENT_MODEL
-              value: gemini-4-argon
-            - name: EVENTS_AGENT_MODEL
-              value: gemini-3.8-flash
-            - name: METRICS_AGENT_MODEL
-              value: gemini-3.8-flash
-            - name: LOGS_AGENT_MODEL
-              value: gemini-3.8-flash
+            - name: ANALYSIS_MODEL
+              value: gemini-4-hydrogen
+            - name: ANALYSIS_THINKING_LEVEL
+              value: high
+            # Empty by default; set gemini-4-argon to enable escalation.
+            - name: ANALYSIS_SECOND_OPINION_MODEL
+              value: ""
+            - name: DECISION_AGENT_MODEL
+              value: gemini-decision-1
+            - name: DECISION_GRADING_MODE
+              value: enforce
+            # A2A JSON-RPC endpoint; model and GitHub credentials live in that service.
+            - name: REMEDIATION_AGENT_URL
+              value: "http://remediation-agent.remediation-system.svc.cluster.local:8080"
             - name: GEMINI_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: argo-rollouts-secret
                   key: GEMINI_API_KEY
-            # Optional: lets the RemediationAgent open fix PRs for code bugs
-            - name: GITHUB_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: argo-rollouts-secret
-                  key: GITHUB_TOKEN
-                  optional: true
             - name: LOGS_AGENT_URL
               value: "http://kubernetes-agent-logs.argo-rollouts.svc.cluster.local:8080"
             - name: METRICS_AGENT_URL

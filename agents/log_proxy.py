@@ -26,11 +26,10 @@ def get_first_pod_logs(namespace: str, label_selector: str) -> str:
 
     _ensure_config()
     v1 = client.CoreV1Api()
-    pods = v1.list_namespaced_pod(namespace, label_selector=label_selector)
-    if not pods.items:
-        return f"No pods found in namespace '{namespace}' matching selector '{label_selector}'"
-
-    pod = next((p for p in pods.items if p.metadata.deletion_timestamp is None), pods.items[0])
+    pods = v1.list_namespaced_pod(namespace, label_selector=label_selector, _request_timeout=10)
+    pod = next((p for p in pods.items if p.metadata.deletion_timestamp is None), None)
+    if pod is None:
+        raise ValueError(f"No non-terminating pods in namespace '{namespace}' matching selector '{label_selector}'")
     pod_name = pod.metadata.name
 
     container_name = ""
@@ -41,5 +40,9 @@ def get_first_pod_logs(namespace: str, label_selector: str) -> str:
     if not container_name and pod.spec.containers:
         container_name = pod.spec.containers[0].name
 
-    logs = v1.read_namespaced_pod_log(pod_name, namespace, container=container_name, tail_lines=200)
+    logs = v1.read_namespaced_pod_log(
+        pod_name, namespace, container=container_name, tail_lines=200,
+        _request_timeout=10,
+    )
+    logs = (logs or "")[-48_000:]
     return f"--- LOGS FOR POD {pod_name} ({label_selector}) ---\n{logs}"

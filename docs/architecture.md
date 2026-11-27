@@ -1,97 +1,115 @@
-# Architecture: Antigravity agent team
+# Architecture: evidence-first Antigravity agent team
 
-The Antigravity agents analyze a canary rollout on behalf of the Argo Rollouts metric AI plugin.
-A lead orchestrator fans the analysis out to three specialists in parallel, runs a consensus
-debate, returns a promote/abort verdict, and (for code bugs) opens a remediation PR and a `jules`
-issue in the background.
-
-![Antigravity agent architecture](architecture.png)
-
-```mermaid
-graph TB
-    subgraph cluster["GKE cluster"]
-        subgraph argo["Argo Rollouts"]
-            Rollout["Rollout canary steps"] -->|"runs AnalysisRun"| Plugin["Metric AI plugin"]
-        end
-
-        subgraph ns["namespace: argo-rollouts"]
-            Orch["Lead Orchestrator (Deployment)<br/>scatter-gather + consensus debate<br/>remediation agent, activity feed<br/>holds GITHUB_TOKEN"]
-            Metrics["Metrics Analyst (Deployment)"]
-            Events["Events Analyst (Deployment)"]
-            Proxy["Log Proxy (Deployment, trusted)<br/>ServiceAccount: pods/log read"]
-
-            subgraph sbnode["gVisor node pool (sandbox.gke.io/runtime=gvisor)"]
-                subgraph sb["Sandbox CR: agents.x-k8s.io/v1alpha1"]
-                    Logs["Log Analyst pod<br/>runtimeClassName: gvisor<br/>no ServiceAccount token<br/>runAsNonRoot (uid 1000)"]
-                end
-            end
-        end
-
-        subgraph app["Workload namespace"]
-            Canary["Canary + stable pods"]
-            Dash["Demo dashboard<br/>polls /a2a/events"]
-        end
-
-        K8s["Kubernetes API"]
-        MS["Metrics Server"]
-    end
-
-    Gemini["Gemini API<br/>gemini-3.8-flash: specialists<br/>gemini-4-argon: orchestrator + remediation"]
-    GH["GitHub<br/>remediation PR + issue labeled jules"]
-    Jules["Jules<br/>opens a PR for the issue"]
-
-    Plugin -->|"POST /a2a/analyze"| Orch
-    Orch -->|"/analyze/logs"| Logs
-    Orch -->|"/analyze/metrics"| Metrics
-    Orch -->|"/analyze/events"| Events
-    Logs -->|"GET /pod-logs (only path to cluster data)"| Proxy
-    Proxy -->|"get pods/log"| K8s
-    Metrics -->|"pod CPU/memory"| MS
-    Events -->|"list events"| K8s
-    K8s -.- Canary
-    Orch -->|"verdict: promote / abort"| Plugin
-    Orch -->|"code bug: read files, open PR + issue (background)"| GH
-    GH -->|"jules label"| Jules
-    Orch -->|"GET /a2a/events"| Dash
-    Logs -.->|"LLM calls"| Gemini
-    Metrics -.-> Gemini
-    Events -.-> Gemini
-    Orch -.-> Gemini
-```
-
-## Components
-
-| Component | Runs as | Role |
-|-----------|---------|------|
-| Lead Orchestrator | Deployment | Receives `/a2a/analyze`, runs the three specialists concurrently, hosts the consensus debate, returns the verdict, starts remediation, and serves the activity feed (`/a2a/events`) |
-| Log Analyst | **Sandbox CR in gVisor** | Analyzes pod logs. The only agent reading untrusted, workload-authored text (logs can carry prompt injection), so it is isolated |
-| Metrics Analyst | Deployment | Compares canary and stable CPU/memory via the Metrics Server |
-| Events Analyst | Deployment | Reads Kubernetes events for the canary pods |
-| Log Proxy | Deployment (trusted) | Holds the ServiceAccount and serves `GET /pod-logs` to the sandboxed Log Analyst |
-| Remediation Agent | In the orchestrator | For code bugs, reads the repo over the GitHub REST API, proposes a minimal fix, opens a PR, then a `jules`-labeled issue |
+The Python agent mirrors the Java analysis pipeline's eight logical roles, while
+using Google Gemini and Google Decisions instead of an OpenAI-compatible primary
+and Typesafe grading. Logical roles do not require one deployment each.
 
 ## Request flow
 
-1. An Argo Rollouts `AnalysisRun` calls the metric AI plugin, which calls `POST /a2a/analyze` on the orchestrator.
-2. The orchestrator calls the three specialists in parallel. The Log Analyst fetches logs through the Log Proxy.
-3. The specialists' reports go into a consensus debate, which produces the verdict (promote or abort) and a `codeBug` flag.
-4. The verdict returns to the plugin immediately, so the rollout can abort without waiting.
-5. If `codeBug` is set, remediation runs in the background (150s timeout): it opens a PR and a `jules` issue, and Jules then opens its own PR.
-6. Every step is emitted as an activity event. The dashboard polls `/a2a/events` and shows them live.
+1. `/analyze` or `/a2a/analyze` validates namespace, Rollout name, selectors, model
+   overrides, operator notes, and the opt-in pause gate.
+2. `AnalysisOrchestratorAgent` calls `AnalysisDataAgent`. Its three parallel workers
+   are `DiagnosticsDataAgent`, `RolloutStatusDataAgent`, and `MetricsDataAgent`.
+3. Diagnostics combines stable/canary logs from the isolated log collector with
+   pod readiness/restart data and pod-UID-scoped events. Rollout status comes from
+   the named `argoproj.io/v1alpha1` Rollout. Metrics samples application counters
+   over bounded windows, keeping error rates, mean/worst-pod latency and resource
+   snapshots. Unavailable data is an explicit error, never a healthy observation.
+4. `DataCombinerAgent` builds a validated evidence bundle. `AnalysisAgent` sends
+   that bundle and operator notes to `gemini-4-hydrogen` with native JSON Schema
+   output. It has no tools or ability to execute generated code.
+5. Google `gemini-decision-1` grades the proposed conclusion using independent
+   contradiction and sufficiency questions. Missing answers, safety blocks, and
+   invalid probabilities are grading failures, not rollback verdicts.
+6. In default `enforce` mode, a clearly disputed conclusion can trigger a configured
+   `SecondOpinionAnalysisAgent` (`gemini-4-argon`). It sees the same evidence, not
+   the primary answer. Its replacement conclusion is graded once; there is no
+   recursive debate. Failed escalation retains the primary conclusion and grade.
+7. An opt-in uncertainty gate pauses only promotion conclusions below threshold.
+   The Rollout patch is read back before reporting `pausedRollout`. Failure of a
+   required pause fails the HTTP measurement rather than silently promoting.
+8. The final decision event precedes background external remediation. A final
+   rollback with `repoUrl` delegates `CODE_BUG` or `OPERATIONAL` over A2A. A promotion
+   does not remediate, even when it reverses the primary answer.
 
-## Why the Log Analyst is sandboxed
+The `AnalysisAgent` and `SecondOpinionAnalysisAgent` are the two generative roles.
+The six other roles are deterministic. The Decisions grader and remediation
+coordinator are supporting components.
 
-| Layer | What it protects |
-|-------|------------------|
-| gVisor (`runtimeClassName: gvisor`) | Container escapes: syscalls hit a user-space kernel, not the host kernel |
-| agent-sandbox `Sandbox` CR | Declarative single-pod lifecycle for the untrusted workload |
-| `automountServiceAccountToken: false` | A compromised agent has no Kubernetes credentials |
-| Log Proxy | The only component with pod/log read access, behind a narrow HTTP endpoint |
-| `runAsNonRoot`, uid 1000 | No root in the container (the SDK needs `HOME=/tmp`) |
+## Confidence semantics
 
-### Scope of the boundary
+The HTTP `confidence` remains the selected analysis model's self-reported value.
+The grader's contradiction/sufficiency probabilities produce a compatibility
+support score with the Java veto/neutral bands, not a calibrated overall
+probability. Only a score below 0.30 changes effective confidence in `enforce`
+mode. A neutral/thin grade does not lower confidence or trigger escalation.
+Unavailable grading uses self-reported confidence, with an explicit error event.
 
-Logs are the highest-risk input: unstructured text written by the workload under test, so a bad canary can embed prompt-injection text. Metrics are numeric and events are short system messages (though events can carry free text). All three analysts let the LLM choose tool arguments (namespace, label selector). The Metrics and Events analysts run as plain Deployments with in-process access to the Metrics Server and Kubernetes API. The sandbox therefore contains the riskiest input but is not a complete boundary. Sandboxing them too is a possible hardening step.
+The default `enforce` mode applies disputed grades to effective confidence and
+can trigger a configured second opinion. Explicit `shadow` mode observes grading
+without affecting the conclusion, effective confidence or escalation. Validate
+against labeled fixtures and real traffic; do not assume Typesafe's calibration
+transfers to Google. The primary model must still disclose missing/thin evidence
+and reduce its self-reported confidence appropriately.
 
-Manifests: [`k8s/agents.yaml`](../k8s/agents.yaml) and [`k8s/log-analyst-sandbox.yaml`](../k8s/log-analyst-sandbox.yaml).
-The sandbox needs a `gvisor` RuntimeClass (GKE Sandbox) and the `agents.x-k8s.io` Sandbox CRD.
+## Deployment and trust boundaries
+
+```mermaid
+flowchart TB
+    Plugin[Argo Rollouts metric plugin] --> Orch[Orchestrator Deployment]
+    Orch --> Logs[Logs Sandbox: gVisor, non-root, no token]
+    Orch --> Events[Pod diagnostics Deployment]
+    Orch --> Metrics[Metrics Deployment]
+    Logs --> Proxy[Trusted log proxy Deployment]
+    Proxy -->|pod logs| K8s[Kubernetes API]
+    Events -->|pods and scoped events| K8s
+    Metrics -->|pod proxy app metrics and metrics.k8s.io| K8s
+    Orch -->|Rollout read and optional pause patch| K8s
+    Orch -->|native structured analysis and grading| Google[Gemini API]
+    Orch -->|background A2A| Remote[External remediation service]
+    Remote -->|verified code fix or operational issue| GitHub[GitHub]
+```
+
+Only the orchestrator needs `GEMINI_API_KEY`. No collector has a model, model
+tools, or API key. Model output cannot select Kubernetes query arguments: plain
+code uses the validated request selectors. Workload logs and event messages remain
+untrusted input to the analyzer and grader; both prompts treat them as data.
+
+The log collector retains its gVisor Sandbox CR, `automountServiceAccountToken:
+false`, non-root UID, and trusted log-proxy-only access. The proxy preserves its
+protected-namespace deny-list and bounded log reads; no model gets Kubernetes
+credentials. This isolates log acquisition; it is not a claim that arbitrary
+natural-language analysis is immune to prompt injection.
+
+The orchestrator uses a separate ServiceAccount for Rollout read/patch access;
+the shared collector account cannot pause Rollouts. Pod proxy reads require
+`pods/proxy` permission. Default manifests use cross-namespace ClusterRoles;
+deployments with fixed workload namespaces should replace them with narrower
+Roles/RoleBindings.
+
+The remote remediation service owns its sandbox, model and GitHub write
+credentials. This agent only sends the typed Java-compatible request and reports
+the A2A task artifact. Its optional bearer token is not sent to Google.
+
+## Compatibility and failure behavior
+
+The plugin's `{userId,prompt,context}` input and
+`{analysis,rootCause,remediation,promote,confidence,pausedRollout?}` output remain.
+`codeBug`, `votingRationale`, and `modelResults` remain additive dashboard fields;
+`modelResults` now lists actual generative conclusions, not fabricated collector
+votes. `effectiveConfidence`, `gradingMode`, and `evidenceStatus` are additive.
+
+Existing collector role paths retain `analysis` text plus a new validated
+`evidence` envelope. The HTTP activity feed retains
+`{id,timestamp,type,message,details}` and supports `since`. Quality, escalation and
+pause events extend the existing event types.
+
+Invalid primary output is an HTTP failure, never a generated default verdict.
+Failed collectors remain visible in evidence and activity errors. Grading errors
+fall back explicitly; second-opinion errors retain the primary. A required pause
+failure is an HTTP failure. External remediation errors cannot revise a returned
+verdict and are reported through the feed. Client tasks are canceled at shutdown.
+
+See [configuration and validation commands](../README.md). The old
+`architecture.png` and recorded demo depict the previous specialist-voting design;
+the diagrams above describe the current implementation.
