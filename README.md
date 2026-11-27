@@ -63,11 +63,12 @@ alone is neutral. Only a score below 0.30 can lower effective confidence or
 trigger a configured second opinion; that conclusion is graded at most once more.
 If grading is unavailable, the selected analysis model's confidence stands.
 
-**Grading defaults to `shadow` mode.** Scores are observable but cannot change the
-decision, confidence, or trigger escalation. Evaluate labeled healthy, code-error,
-resource, latency, thin-data, and disagreement cases with your own traffic before
-setting `DECISION_GRADING_MODE=enforce`; Typesafe calibration does not transfer
-automatically to Google.
+**Grading defaults to `enforce` mode.** Disputed scores affect effective confidence
+and can trigger a configured second opinion. Set `DECISION_GRADING_MODE=shadow`
+to observe scores without affecting effective confidence or triggering escalation.
+Validate labeled healthy, code-error, resource, latency, thin-data, and disagreement
+cases with your own traffic; Typesafe calibration does not transfer automatically
+to Google.
 
 HTTP `confidence` always stays the final analysis model's self-reported integer
 0-100. `effectiveConfidence` drives the pause gate and decision events. The request
@@ -123,7 +124,7 @@ Roles/RoleBindings for deployments that do not need that scope.
 | `ANALYSIS_SECOND_OPINION_MODEL` | Empty/disabled; set `gemini-4-argon` to enable in enforce mode |
 | `ANALYSIS_SECOND_OPINION_THINKING_LEVEL` | `high`, independently configurable |
 | `DECISION_AGENT_MODEL` | `gemini-decision-1` |
-| `DECISION_GRADING_MODE` | `shadow`; `enforce` enables the veto/escalation behavior |
+| `DECISION_GRADING_MODE` | `enforce`; `shadow` observes scores without veto/escalation |
 | `DECISIONS_API_URL` | Google `https://generativelanguage.googleapis.com/v1beta/decisions` |
 | `ANALYSIS_MIN_CANARY_REQUESTS` | `500` |
 | `ANALYSIS_SAMPLE_WINDOW_SECONDS` | `10` (greater than 0, at most 30) |

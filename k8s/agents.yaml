@@ -262,7 +262,7 @@ spec:
             - name: DECISION_AGENT_MODEL
               value: gemini-decision-1
             - name: DECISION_GRADING_MODE
-              value: shadow
+              value: enforce
             # A2A JSON-RPC endpoint; model and GitHub credentials live in that service.
             - name: REMEDIATION_AGENT_URL
               value: ""

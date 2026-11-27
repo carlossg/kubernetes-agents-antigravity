@@ -25,7 +25,7 @@ class AnalysisOrchestratorAgent:
             second_opinion_model if second_opinion_model is not None
             else os.getenv("ANALYSIS_SECOND_OPINION_MODEL", "")
         )
-        self.grading_mode = os.getenv("DECISION_GRADING_MODE", "shadow")
+        self.grading_mode = os.getenv("DECISION_GRADING_MODE", "enforce")
         if self.grading_mode not in {"shadow", "enforce"}:
             raise ValueError("DECISION_GRADING_MODE must be shadow or enforce")
 

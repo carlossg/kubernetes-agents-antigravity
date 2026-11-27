@@ -366,7 +366,7 @@ http_request_duration_seconds{quantile="0.95"} 0.1
 
 class PipelineTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.env = patch.dict(os.environ, {"DECISION_GRADING_MODE": "enforce"}, clear=True)
+        self.env = patch.dict(os.environ, {}, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
         self.feed = patch("agents.activity.feed", activity.ActivityFeed())
@@ -389,6 +389,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["promote"])
         self.assertEqual(result["confidence"], 92)
         self.assertEqual(result["effectiveConfidence"], 92)
+        self.assertEqual(result["gradingMode"], "enforce")
         self.assertNotIn("pausedRollout", result)
         self.assertEqual(result["modelResults"][0]["modelName"], "gemini-4-hydrogen")
 

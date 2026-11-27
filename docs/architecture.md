@@ -45,9 +45,10 @@ probability. Only a score below 0.30 changes effective confidence in `enforce`
 mode. A neutral/thin grade does not lower confidence or trigger escalation.
 Unavailable grading uses self-reported confidence, with an explicit error event.
 
-The default `shadow` mode observes grading without affecting the conclusion,
-effective confidence or escalation. Evaluate labeled fixtures and live shadow
-traffic before enabling enforcement; do not assume Typesafe's calibration
+The default `enforce` mode applies disputed grades to effective confidence and
+can trigger a configured second opinion. Explicit `shadow` mode observes grading
+without affecting the conclusion, effective confidence or escalation. Validate
+against labeled fixtures and real traffic; do not assume Typesafe's calibration
 transfers to Google. The primary model must still disclose missing/thin evidence
 and reduce its self-reported confidence appropriately.
 
