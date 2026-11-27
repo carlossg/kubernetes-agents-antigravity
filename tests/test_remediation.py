@@ -19,9 +19,9 @@ def request(category="CODE_BUG"):
 
 
 def artifact(status="success", link="https://github.com/o/r/pull/1"):
-    return {"kind": "task", "id": "task-1", "status": {"state": "completed"}, "artifacts": [{
-        "parts": [{"kind": "text", "text": json.dumps({"status": status, "prLink": link})}],
-    }]}
+    return {"task": {"id": "task-1", "status": {"state": "TASK_STATE_COMPLETED"}, "artifacts": [{
+        "parts": [{"text": json.dumps({"status": status, "prLink": link})}],
+    }]}}
 
 
 class ActivityFeedTests(unittest.TestCase):
@@ -44,11 +44,12 @@ class RemediationTests(unittest.IsolatedAsyncioTestCase):
         calls = []
 
         def handler(http_request):
+            self.assertEqual(http_request.headers.get("A2A-Version"), "1.0")
             payload = json.loads(http_request.content)
             calls.append(payload)
             result = (
-                {"kind": "task", "id": "task-1", "status": {"state": "working"}}
-                if payload["method"] == "message/send" else artifact()
+                {"task": {"id": "task-1", "status": {"state": "TASK_STATE_WORKING"}}}
+                if payload["method"] == "SendMessage" else artifact()
             )
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "result": result})
 
@@ -56,7 +57,7 @@ class RemediationTests(unittest.IsolatedAsyncioTestCase):
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
                 response = await call_remediation(request(), "http://remote/a2a", http_client=http)
         self.assertEqual(response.prLink, "https://github.com/o/r/pull/1")
-        self.assertEqual([c["method"] for c in calls], ["message/send", "tasks/get"])
+        self.assertEqual([c["method"] for c in calls], ["SendMessage", "GetTask"])
         payload = json.loads(calls[0]["params"]["message"]["parts"][0]["text"])
         self.assertEqual(payload, request().model_dump())
         self.assertNotIn("model", payload)

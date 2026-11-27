@@ -265,7 +265,7 @@ spec:
               value: enforce
             # A2A JSON-RPC endpoint; model and GitHub credentials live in that service.
             - name: REMEDIATION_AGENT_URL
-              value: ""
+              value: "http://remediation-agent.remediation-system.svc.cluster.local:8080"
             - name: GEMINI_API_KEY
               valueFrom:
                 secretKeyRef:

@@ -14,7 +14,12 @@ FAILED_STATUSES = {"tests_failed", "agent_error", "rejected", "timeout", "infra_
 
 
 def parse_artifact(result: dict) -> RemediationResponse:
-    if result.get("kind") == "message":
+    if "task" in result and isinstance(result["task"], dict):
+        result = result["task"]
+    elif "message" in result and isinstance(result["message"], dict):
+        result = result["message"]
+
+    if result.get("kind") == "message" or ("parts" in result and "artifacts" not in result):
         parts = result.get("parts", [])
     else:
         artifacts = result.get("artifacts")
@@ -27,7 +32,11 @@ def parse_artifact(result: dict) -> RemediationResponse:
         not isinstance(p, dict) or not isinstance(p.get("text", ""), str) for p in parts
     ):
         raise ValueError("Invalid A2A text parts")
-    text = "".join(p.get("text", "") for p in parts if p.get("kind") == "text")
+    text = "".join(
+        p.get("text", "")
+        for p in parts
+        if p.get("kind") in (None, "text") and p.get("text")
+    )
     response = RemediationResponse.model_validate_json(text)
     if response.status == "success" and not response.prLink:
         raise ValueError("Successful remediation did not return a PR")
@@ -45,7 +54,7 @@ async def call_remediation(
     async def run(http):
         async def rpc(method: str, params: dict):
             request_id = str(uuid.uuid4())
-            headers = {}
+            headers = {"A2A-Version": "1.0"}
             token = os.getenv("REMEDIATION_AGENT_TOKEN")
             if token:
                 headers["Authorization"] = f"Bearer {token}"
@@ -64,25 +73,33 @@ async def call_remediation(
                 raise ValueError("Missing A2A result")
             return result
 
-        result = await rpc("message/send", {
+        result = await rpc("SendMessage", {
             "message": {
-                "kind": "message", "messageId": str(uuid.uuid4()), "role": "user",
-                "parts": [{"kind": "text", "text": request.model_dump_json()}],
+                "messageId": str(uuid.uuid4()), "role": "ROLE_USER",
+                "parts": [{"text": request.model_dump_json()}],
             },
             "configuration": {"blocking": True, "acceptedOutputModes": ["text/plain", "application/json"]},
         })
-        while result.get("kind") == "task":
-            status = result.get("status")
+
+        def _unwrap_task(res: dict) -> dict | None:
+            if isinstance(res.get("task"), dict):
+                return res["task"]
+            if res.get("kind") == "task":
+                return res
+            return None
+
+        while (task := _unwrap_task(result)) is not None:
+            status = task.get("status")
             if not isinstance(status, dict):
                 raise ValueError("Missing A2A task status")
             state = status.get("state")
-            if state == "completed":
+            if state in {"completed", "TASK_STATE_COMPLETED"}:
                 break
-            if state not in {"submitted", "working"} or not result.get("id"):
+            if state not in {"submitted", "working", "TASK_STATE_SUBMITTED", "TASK_STATE_WORKING"} or not task.get("id"):
                 raise ValueError(f"Remediation task did not complete: {state}")
             await asyncio.sleep(2)
-            result = await rpc("tasks/get", {"id": result["id"]})
-        if result.get("kind") not in {"task", "message"}:
+            result = await rpc("GetTask", {"id": task["id"]})
+        if _unwrap_task(result) is None and result.get("kind") != "message" and not isinstance(result.get("message"), dict):
             raise ValueError("Invalid A2A result kind")
         return parse_artifact(result)
 
