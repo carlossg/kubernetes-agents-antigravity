@@ -199,6 +199,24 @@ def fetch_kubernetes_pod_metrics(namespace: str, label_selector: str) -> dict:
     }
 
 
+async def _gather_side_scrapes(
+    selectors: dict[str, str], scrape_fn, timeout_seconds: float,
+) -> tuple[dict[str, tuple[dict, list[str]]], list[str]]:
+    tasks = {side: asyncio.create_task(scrape_fn(selector)) for side, selector in selectors.items()}
+    done, pending = await asyncio.wait(tasks.values(), timeout=max(0.01, timeout_seconds))
+    results = {}
+    timed_out = []
+    for side, task in tasks.items():
+        if task in done:
+            results[side] = task.result()
+        else:
+            task.cancel()
+            timed_out.append(side)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    return results, timed_out
+
+
 class MetricsDataAgent:
     async def collect(self, namespace: str, stable_selector: str, canary_selector: str) -> EvidenceReport:
         await asyncio.to_thread(ensure_config)
@@ -216,22 +234,23 @@ class MetricsDataAgent:
         start = time.monotonic()
         sampling_deadline = start + SAMPLING_TIMEOUT_SECONDS
         total_deadline = start + COLLECTION_DEADLINE_SECONDS
-        baseline_timed_out = False
-        try:
-            async with asyncio.timeout(max(0.01, sampling_deadline - time.monotonic())):
-                initial = await asyncio.gather(*(scrape(s) for s in selectors.values()))
-        except TimeoutError:
-            baseline_timed_out = True
-            initial = [({}, []), ({}, [])]
-            report.errors.append("metrics baseline timed out at collection deadline")
-        baseline = {side: pair[0] for side, pair in zip(selectors, initial)}
-        initial_errors = {side: list(pair[1]) for side, pair in zip(selectors, initial)}
+        initial_results, timed_out_baseline = await _gather_side_scrapes(
+            selectors, scrape, sampling_deadline - time.monotonic(),
+        )
+        for side in timed_out_baseline:
+            report.errors.append(f"{side}: metrics baseline timed out at collection deadline")
+        baseline = {side: initial_results[side][0] if side in initial_results else {} for side in selectors}
+        initial_errors = {
+            side: list(initial_results[side][1]) if side in initial_results else ["baseline timed out"]
+            for side in selectors
+        }
         previous = {side: dict(snap) for side, snap in baseline.items()}
         seen_pods = {side: set(snap) for side, snap in baseline.items()}
         invalid_pods = {side: set() for side in selectors}
-        for side, (_, errors) in zip(selectors, initial):
+        for side, (snap, errors) in initial_results.items():
             report.errors.extend(f"{side}: {e}" for e in errors)
-        if not baseline_timed_out:
+        active_selectors = {s: sel for s, sel in selectors.items() if s in initial_results}
+        if active_selectors:
             for attempt in range(waits + 1):
                 remaining = sampling_deadline - time.monotonic()
                 if remaining <= 0:
@@ -240,12 +259,16 @@ class MetricsDataAgent:
                 try:
                     async with asyncio.timeout(remaining):
                         await asyncio.sleep(seconds)
-                        samples = await asyncio.gather(*(scrape(s) for s in selectors.values()))
                 except TimeoutError:
                     report.warnings.append("metrics sampling stopped at collection deadline")
                     break
+                samples, timed_out = await _gather_side_scrapes(
+                    active_selectors, scrape, sampling_deadline - time.monotonic(),
+                )
                 elapsed = time.monotonic() - start
-                for side, (snapshot, errors) in zip(selectors, samples):
+                for side in timed_out:
+                    report.errors.append(f"{side}: metrics sampling timed out at collection deadline")
+                for side, (snapshot, errors) in samples.items():
                     report.errors.extend(f"{side}: {e}" for e in errors)
                     for pod, sample in snapshot.items():
                         if pod in previous[side]:
@@ -273,9 +296,12 @@ class MetricsDataAgent:
                         },
                     }
                     report.warnings.extend(f"{side}: {w}" for w in window["warnings"])
-                if report.data["canary"]["sampleSufficient"]:
+                if timed_out:
+                    report.warnings.append("metrics sampling stopped at collection deadline")
                     break
-                if attempt < waits:
+                if report.data.get("canary", {}).get("sampleSufficient"):
+                    break
+                if attempt < waits and "canary" in report.data:
                     activity.feed.emit(activity.TOOL_RESULT, "Gathering more canary evidence",
                                        f"requests={report.data['canary']['windowRequests']} minimum={minimum}")
         for side, selector in selectors.items():

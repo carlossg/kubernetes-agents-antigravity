@@ -178,6 +178,17 @@ remediation endpoint. The log sandbox requires a `gvisor` RuntimeClass and the
 `agents.x-k8s.io` Sandbox CRD. The checked-in image digest is not rebuilt
 automatically by source changes.
 
+When upgrading from an earlier release that used the retired shared RBAC
+manifests, prune the old cluster-wide bindings manually (`kubectl apply -k`
+does not delete removed resources) after confirming no workloads still use
+`kubernetes-agents-sa`:
+
+```bash
+kubectl delete clusterrolebinding kubernetes-agents-rolebinding --ignore-not-found
+kubectl delete clusterrole kubernetes-agents-role --ignore-not-found
+kubectl delete serviceaccount kubernetes-agents-sa -n argo-rollouts --ignore-not-found
+```
+
 Example request (from an environment able to reach the orchestrator):
 
 ```bash

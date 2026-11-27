@@ -1,5 +1,7 @@
 """Collect -> analyze -> grade -> optional second opinion -> pause -> remediate."""
+import asyncio
 import os
+import time
 
 import httpx
 from kubernetes import client
@@ -12,6 +14,9 @@ from agents.data import AnalysisDataAgent
 from agents.decisions import AnalysisGrade, grade_analysis
 from agents.pause import pause_rollout
 from agents.remediation import RemediationAgent
+
+ANALYSIS_BUDGET_SECONDS = 270.0
+PAUSE_RESERVE_SECONDS = 20.0
 
 
 class AnalysisOrchestratorAgent:
@@ -65,29 +70,40 @@ class AnalysisOrchestratorAgent:
             uncertaintyThreshold=uncertainty_threshold,
         )
         activity.feed.emit(activity.ANALYSIS_START, f"Analyzing canary rollout '{rollout_name}'", namespace)
+        deadline = (
+            time.monotonic()
+            + float(os.getenv("ANALYSIS_TIMEOUT_SECONDS", str(ANALYSIS_BUDGET_SECONDS)))
+            - PAUSE_RESERVE_SECONDS
+        )
         evidence = await AnalysisDataAgent().collect(namespace, rollout_name, stable_selector, canary_selector)
         notes = "\n\n".join(s for s in (prompt, extra_prompt) if s)
         result = await self._analyze(self.primary, evidence, notes)
         model_results = [{"modelName": self.primary.model, **result.model_dump()}]
         grade = await self._grade(result, evidence)
         if self.grading_mode == "enforce" and grade is not None and grade.disputed and self.second_opinion_model:
-            activity.feed.emit(activity.ANALYSIS_ESCALATED, "Requesting an independent second opinion",
-                               self.second_opinion_model)
-            try:
-                escalated = await self._analyze(
-                    SecondOpinionAnalysisAgent(self.second_opinion_model), evidence, notes,
-                )
-            except (httpx.HTTPError, ValueError) as exc:
-                activity.feed.emit(activity.ERROR, "Second opinion unavailable; retaining primary conclusion", str(exc))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                activity.feed.emit(activity.ERROR, "Second opinion skipped; retaining primary conclusion",
+                                   "Insufficient time budget before pause gate")
             else:
-                regrade = await self._grade(
-                    escalated, evidence,
-                    fallback_message="Grader unavailable for second opinion; retaining primary conclusion and grade",
-                )
-                if regrade is not None:
-                    result = escalated
-                    model_results.append({"modelName": self.second_opinion_model, **result.model_dump()})
-                    grade = regrade
+                activity.feed.emit(activity.ANALYSIS_ESCALATED, "Requesting an independent second opinion",
+                                   self.second_opinion_model)
+                try:
+                    async with asyncio.timeout(remaining):
+                        escalated = await self._analyze(
+                            SecondOpinionAnalysisAgent(self.second_opinion_model), evidence, notes,
+                        )
+                        regrade = await self._grade(
+                            escalated, evidence,
+                            fallback_message="Grader unavailable for second opinion; retaining primary conclusion and grade",
+                        )
+                except (httpx.HTTPError, ValueError, TimeoutError) as exc:
+                    activity.feed.emit(activity.ERROR, "Second opinion unavailable; retaining primary conclusion", str(exc))
+                else:
+                    if regrade is not None:
+                        result = escalated
+                        model_results.append({"modelName": self.second_opinion_model, **result.model_dump()})
+                        grade = regrade
 
         effective = (
             grade.effective_confidence(result.confidence)

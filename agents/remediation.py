@@ -13,21 +13,7 @@ _background_tasks: set[asyncio.Task] = set()
 FAILED_STATUSES = {"tests_failed", "agent_error", "rejected", "timeout", "infra_error", "pr_failed"}
 
 
-def parse_artifact(result: dict) -> RemediationResponse:
-    if "task" in result and isinstance(result["task"], dict):
-        result = result["task"]
-    elif "message" in result and isinstance(result["message"], dict):
-        result = result["message"]
-
-    if result.get("kind") == "message" or ("parts" in result and "artifacts" not in result):
-        parts = result.get("parts", [])
-    else:
-        artifacts = result.get("artifacts")
-        if not isinstance(artifacts, list) or not artifacts or any(
-            not isinstance(a, dict) or not isinstance(a.get("parts"), list) for a in artifacts
-        ):
-            raise ValueError("Invalid A2A artifacts")
-        parts = artifacts[-1]["parts"]
+def _parse_parts_response(parts: list) -> RemediationResponse:
     if not isinstance(parts, list) or any(
         not isinstance(p, dict) or not isinstance(p.get("text", ""), str) for p in parts
     ):
@@ -51,6 +37,28 @@ def parse_artifact(result: dict) -> RemediationResponse:
         ):
             raise ValueError(f"Invalid remediation {label} URL")
     return response
+
+
+def parse_artifact(result: dict) -> RemediationResponse:
+    if "task" in result and isinstance(result["task"], dict):
+        result = result["task"]
+    elif "message" in result and isinstance(result["message"], dict):
+        result = result["message"]
+
+    if result.get("kind") == "message" or ("parts" in result and "artifacts" not in result):
+        return _parse_parts_response(result.get("parts", []))
+    artifacts = result.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts or any(
+        not isinstance(a, dict) or not isinstance(a.get("parts"), list) for a in artifacts
+    ):
+        raise ValueError("Invalid A2A artifacts")
+    last_error: ValueError | None = None
+    for item in reversed(artifacts):
+        try:
+            return _parse_parts_response(item["parts"])
+        except ValueError as exc:
+            last_error = exc
+    raise last_error or ValueError("Invalid A2A artifacts")
 
 
 async def call_remediation(

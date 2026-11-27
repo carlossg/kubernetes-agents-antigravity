@@ -114,6 +114,13 @@ class RemediationTests(unittest.IsolatedAsyncioTestCase):
         ]}}
         self.assertEqual(parse_artifact(result).prLink, "https://github.com/o/r/pull/7")
 
+    async def test_multiple_artifacts_finds_json_result_when_not_last(self):
+        result = {"task": {"id": "task-1", "status": {"state": "TASK_STATE_COMPLETED"}, "artifacts": [
+            {"parts": [{"text": json.dumps({"status": "success", "prLink": "https://github.com/o/r/pull/8"})}]},
+            {"parts": [{"text": "Execution transcript attached"}]},
+        ]}}
+        self.assertEqual(parse_artifact(result).prLink, "https://github.com/o/r/pull/8")
+
     @patch.dict(os.environ, {"REMEDIATION_AGENT_URL": "http://remote/a2a"}, clear=True)
     async def test_delegation_returns_without_waiting_and_shutdown_cancels(self):
         started = asyncio.Event()

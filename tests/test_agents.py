@@ -575,6 +575,30 @@ http_request_duration_seconds{quantile="0.95"} 0.1
         report = await MetricsDataAgent().collect("ns", "stable", "canary")
         self.assertFalse(report.data["canary"]["sampleSufficient"])
 
+    @patch.dict(os.environ, {"ANALYSIS_MAX_SAMPLE_WAITS": "0"}, clear=True)
+    @patch("agents.metrics.SAMPLING_TIMEOUT_SECONDS", 0.05)
+    @patch("agents.metrics.ensure_config")
+    @patch("agents.metrics.asyncio.sleep", new_callable=AsyncMock)
+    @patch("agents.metrics.fetch_kubernetes_pod_metrics", return_value={})
+    @patch("agents.metrics.scrape_application_metrics")
+    async def test_completed_side_preserved_when_other_scrape_times_out(self, scrape, resources, sleep, config):
+        phase = {"stable": 0, "canary": 0}
+        real_to_thread = asyncio.to_thread
+
+        async def fake_to_thread(fn, *args, **kwargs):
+            if fn is scrape:
+                selector = args[1]
+                phase[selector] += 1
+                if selector == "canary" and phase[selector] > 1:
+                    await asyncio.Future()
+                return {"p": counters(phase[selector] * 600)}, []
+            return await real_to_thread(fn, *args, **kwargs)
+
+        with patch("agents.metrics.asyncio.to_thread", side_effect=fake_to_thread):
+            report = await MetricsDataAgent().collect("ns", "stable", "canary")
+        self.assertEqual(report.data["stable"]["windowRequests"], 600)
+        self.assertTrue(any("canary: metrics sampling timed out" in e for e in report.errors))
+
 
 class PipelineTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -687,6 +711,29 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             "agents.orchestrator.SecondOpinionAnalysisAgent.analyze", AsyncMock(return_value=analysis(True, confidence=85)),
         ), patch(
             "agents.orchestrator.grade_analysis", AsyncMock(side_effect=[AnalysisGrade(0.9, 0.99), ValueError("timeout")]),
+        ), patch("agents.orchestrator.pause_rollout", AsyncMock(return_value="demo")) as pause:
+            result = await LeadOrchestratorAgent().analyze_rollout(
+                "test-ns", "demo", "stable", "canary", pause_on_uncertainty=True, uncertainty_threshold=50,
+            )
+        self.assertTrue(result["promote"])
+        self.assertEqual(result["confidence"], 92)
+        self.assertEqual(result["effectiveConfidence"], 3)
+        self.assertEqual(result["pausedRollout"], "demo")
+        pause.assert_awaited_once_with("test-ns", "demo")
+
+    async def test_second_opinion_timeout_preserves_primary_and_runs_pause(self):
+        async def slow_second_opinion(*args, **kwargs):
+            await asyncio.Future()
+
+        with patch.dict(os.environ, {
+            "ANALYSIS_SECOND_OPINION_MODEL": "gemini-4-argon",
+            "ANALYSIS_TIMEOUT_SECONDS": "20.05",
+        }), patch(
+            "agents.orchestrator.AnalysisAgent.analyze", AsyncMock(return_value=analysis(True, confidence=92)),
+        ), patch(
+            "agents.orchestrator.SecondOpinionAnalysisAgent.analyze", side_effect=slow_second_opinion,
+        ), patch(
+            "agents.orchestrator.grade_analysis", AsyncMock(return_value=AnalysisGrade(0.9, 0.99)),
         ), patch("agents.orchestrator.pause_rollout", AsyncMock(return_value="demo")) as pause:
             result = await LeadOrchestratorAgent().analyze_rollout(
                 "test-ns", "demo", "stable", "canary", pause_on_uncertainty=True, uncertainty_threshold=50,
