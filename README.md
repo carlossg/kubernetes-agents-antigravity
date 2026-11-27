@@ -145,7 +145,7 @@ are sent.
 ## Remediation and activity feed
 
 After the final rollback, a configured `repoUrl` triggers background A2A
-`message/send`, with `tasks/get` polling if needed. The payload matches the Java
+`SendMessage`, with `GetTask` polling if needed. The payload matches the Java
 service contract: `repoUrl`, `baseBranch`, `issueCategory`, `title`, `rootCause`,
 `analysis`, `diagnosticContext`. `CODE_BUG` requests a verified fix PR and
 `OPERATIONAL` requests an issue; the remote service implements that policy.

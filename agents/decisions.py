@@ -102,7 +102,10 @@ async def grade_analysis(
     headers = {"x-goog-api-key": key}
 
     async def send(client):
-        response = await client.post(url, json=body, headers=headers)
+        try:
+            response = await client.post(url, json=body, headers=headers)
+        except httpx.InvalidURL as exc:
+            raise ValueError(f"Invalid DECISIONS_API_URL: {exc}") from exc
         response.raise_for_status()
         return parse_grade(response.json())
 

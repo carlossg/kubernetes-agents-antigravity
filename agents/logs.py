@@ -19,7 +19,10 @@ def fetch_kubernetes_pod_logs(namespace: str, label_selector: str) -> str:
         timeout=30.0,
     )
     response.raise_for_status()
-    return response.json()["logs"]
+    logs = response.json()["logs"]
+    if not isinstance(logs, str):
+        raise ValueError("Invalid log proxy response")
+    return logs
 
 
 def _truncate_logs(logs: str) -> str:

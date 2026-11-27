@@ -21,7 +21,7 @@ and Typesafe grading. Logical roles do not require one deployment each.
 5. Google `gemini-decision-1` grades the proposed conclusion using independent
    contradiction and sufficiency questions. Missing answers, safety blocks, and
    invalid probabilities are grading failures, not rollback verdicts.
-6. In opt-in `enforce` mode, a clearly disputed conclusion can trigger a configured
+6. In default `enforce` mode, a clearly disputed conclusion can trigger a configured
    `SecondOpinionAnalysisAgent` (`gemini-4-argon`). It sees the same evidence, not
    the primary answer. Its replacement conclusion is graded once; there is no
    recursive debate. Failed escalation retains the primary conclusion and grade.

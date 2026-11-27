@@ -227,6 +227,7 @@ class MetricsDataAgent:
         baseline = {side: pair[0] for side, pair in zip(selectors, initial)}
         initial_errors = {side: list(pair[1]) for side, pair in zip(selectors, initial)}
         previous = {side: dict(snap) for side, snap in baseline.items()}
+        seen_pods = {side: set(snap) for side, snap in baseline.items()}
         invalid_pods = {side: set() for side in selectors}
         for side, (_, errors) in zip(selectors, initial):
             report.errors.extend(f"{side}: {e}" for e in errors)
@@ -255,8 +256,14 @@ class MetricsDataAgent:
                                     or sample.get("restartCount", 0) != prior.get("restartCount", 0)):
                                 invalid_pods[side].add(pod)
                         previous[side][pod] = sample
+                    seen_pods[side].update(snapshot)
                     window = window_metrics(baseline[side], snapshot, elapsed, invalid_pods[side])
-                    full_coverage = bool(snapshot) and not initial_errors[side] and not errors
+                    full_coverage = (
+                        bool(snapshot)
+                        and not initial_errors[side]
+                        and not errors
+                        and seen_pods[side] == set(baseline[side]) == set(snapshot)
+                    )
                     report.data[side] = {
                         **window,
                         "sampleSufficient": window["complete"] and full_coverage and (window["windowRequests"] or 0) >= minimum,

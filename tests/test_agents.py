@@ -155,6 +155,11 @@ class ModelAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(disputed.effective_confidence(96), 3)
         self.assertEqual(AnalysisGrade(0.50, 0.99).effective_confidence(5), 5)
 
+    @patch.dict(os.environ, {"GEMINI_API_KEY": "test", "DECISIONS_API_URL": "https://example.com:badport"}, clear=True)
+    async def test_invalid_decisions_url_raises_value_error_for_fallback(self):
+        with self.assertRaises(ValueError):
+            await grade_analysis(analysis(), evidence())
+
     @patch.dict(os.environ, {"GEMINI_API_KEY": "test"}, clear=True)
     async def test_overlong_summary_recovers_without_losing_verdict(self):
         payload = {**analysis(False).model_dump(), "summary": "S" * 140}
@@ -254,6 +259,17 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         report = await collect_report("rollout", None, "", fail, {})
         self.assertEqual(report.status, "unavailable")
         self.assertIn("403", report.errors[0])
+
+    @patch.dict(os.environ, {"LOG_PROXY_URL": "http://proxy"}, clear=True)
+    @patch("agents.logs.httpx.get")
+    async def test_non_string_proxy_logs_marks_only_that_side_unavailable(self, get):
+        resp_ok = SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"logs": "healthy"})
+        resp_null = SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"logs": None})
+        get.side_effect = [resp_ok, resp_null]
+        report = await LogAnalystAgent().collect("ns", "role=stable", "role=canary")
+        self.assertEqual(report.status, "partial")
+        self.assertEqual(report.data, {"stable": "healthy"})
+        self.assertTrue(any("canary logs unavailable" in e for e in report.errors))
 
     @patch.dict(os.environ, {}, clear=True)
     async def test_logs_truncate_from_oldest_end_preserving_header_and_newest_trace(self):
@@ -518,20 +534,46 @@ http_request_duration_seconds{quantile="0.95"} 0.1
     @patch("agents.metrics.scrape_application_metrics")
     async def test_sampling_deadline_preserves_completed_round(self, scrape, resources, config):
         counts = {"stable": 0, "canary": 0}
-        real_sleep = asyncio.sleep
+        waits = 0
 
         def snapshot(namespace, selector):
             counts[selector] += 1
             return {"p": counters(counts[selector] * 200)}, []
 
         async def paced_sleep(_):
-            await real_sleep(0.03)
+            nonlocal waits
+            waits += 1
+            if waits > 1:
+                await asyncio.Future()
 
         scrape.side_effect = snapshot
         with patch("agents.metrics.asyncio.sleep", side_effect=paced_sleep):
             report = await MetricsDataAgent().collect("ns", "stable", "canary")
         self.assertEqual(report.data["canary"]["windowRequests"], 200)
         self.assertTrue(any("collection deadline" in w for w in report.warnings))
+
+    @patch.dict(os.environ, {"ANALYSIS_MAX_SAMPLE_WAITS": "1"}, clear=True)
+    @patch("agents.metrics.ensure_config")
+    @patch("agents.metrics.asyncio.sleep", new_callable=AsyncMock)
+    @patch("agents.metrics.fetch_kubernetes_pod_metrics", return_value={})
+    @patch("agents.metrics.scrape_application_metrics")
+    async def test_pod_churn_across_followups_keeps_sample_insufficient(self, scrape, resources, sleep, config):
+        stable_seq = [({"s": counters(100)}, []), ({"s": counters(700)}, []), ({"s": counters(1300)}, [])]
+        canary_seq = [
+            ({"a": counters(100)}, []),
+            ({"a": counters(400), "b": counters(100)}, []),
+            ({"a": counters(700)}, []),
+        ]
+        idx = {"stable": 0, "canary": 0}
+
+        def snapshot(namespace, selector):
+            i = idx[selector]
+            idx[selector] += 1
+            return (stable_seq if selector == "stable" else canary_seq)[i]
+
+        scrape.side_effect = snapshot
+        report = await MetricsDataAgent().collect("ns", "stable", "canary")
+        self.assertFalse(report.data["canary"]["sampleSufficient"])
 
 
 class PipelineTests(unittest.IsolatedAsyncioTestCase):

@@ -1,18 +1,25 @@
 """Deterministic pod-scoped events and readiness diagnostics."""
 import asyncio
+import time
 
 from kubernetes import client
 from urllib3.exceptions import HTTPError as KubernetesHTTPError
 
-from agents.contracts import EvidenceReport
+from agents.contracts import COLLECTOR_TIMEOUT, EvidenceReport
 from agents.kube import REQUEST_TIMEOUT, ensure_config, list_pods, pod_diagnostics
+
+EVENTS_DEADLINE_SECONDS = COLLECTOR_TIMEOUT - 25.0
 
 
 def collect_events(namespace: str, stable_selector: str, canary_selector: str) -> EvidenceReport:
     ensure_config()
     api = client.CoreV1Api()
     report = EvidenceReport(source="pod_diagnostics")
+    deadline = time.monotonic() + EVENTS_DEADLINE_SECONDS
     for side, selector in (("stable", stable_selector), ("canary", canary_selector)):
+        if deadline - time.monotonic() <= 0:
+            report.errors.append(f"{side}: event collection stopped at collection deadline")
+            continue
         try:
             pods = list_pods(api, namespace, selector)
         except (client.ApiException, KubernetesHTTPError, OSError) as exc:
@@ -23,10 +30,14 @@ def collect_events(namespace: str, stable_selector: str, canary_selector: str) -
             continue
         report.data[side] = {"pods": [pod_diagnostics(p) for p in pods], "events": []}
         for pod in pods:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                report.errors.append(f"{side}: event collection stopped at collection deadline")
+                break
             try:
                 events = api.list_namespaced_event(
                     namespace, field_selector=f"involvedObject.uid={pod.metadata.uid}",
-                    _request_timeout=REQUEST_TIMEOUT,
+                    _request_timeout=max(0.1, min(REQUEST_TIMEOUT, remaining)),
                 )
             except (client.ApiException, KubernetesHTTPError, OSError) as exc:
                 report.errors.append(f"{side}: {pod.metadata.name} events unavailable: {exc}")
