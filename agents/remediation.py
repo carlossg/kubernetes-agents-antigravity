@@ -78,7 +78,7 @@ async def call_remediation(
                 "messageId": str(uuid.uuid4()), "role": "ROLE_USER",
                 "parts": [{"text": request.model_dump_json()}],
             },
-            "configuration": {"blocking": True, "acceptedOutputModes": ["text/plain", "application/json"]},
+            "configuration": {"acceptedOutputModes": ["text/plain", "application/json"]},
         })
 
         def _unwrap_task(res: dict) -> dict | None:
