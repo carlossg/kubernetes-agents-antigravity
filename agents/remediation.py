@@ -23,11 +23,11 @@ def parse_artifact(result: dict) -> RemediationResponse:
         parts = result.get("parts", [])
     else:
         artifacts = result.get("artifacts")
-        if not isinstance(artifacts, list) or any(
+        if not isinstance(artifacts, list) or not artifacts or any(
             not isinstance(a, dict) or not isinstance(a.get("parts"), list) for a in artifacts
         ):
             raise ValueError("Invalid A2A artifacts")
-        parts = [p for a in artifacts for p in a["parts"]]
+        parts = artifacts[-1]["parts"]
     if not isinstance(parts, list) or any(
         not isinstance(p, dict) or not isinstance(p.get("text", ""), str) for p in parts
     ):
@@ -42,9 +42,14 @@ def parse_artifact(result: dict) -> RemediationResponse:
         raise ValueError("Successful remediation did not return a PR")
     if response.status == "issue" and not response.issueLink:
         raise ValueError("Issue remediation did not return an issue")
-    for link in (response.prLink, response.issueLink):
-        if link and not re.fullmatch(r"https://github\.com/[^/\s]+/[^/\s]+/(pull|issues)/[1-9][0-9]*", link):
-            raise ValueError("Invalid remediation artifact URL")
+    for link, kind, label in (
+        (response.prLink, "pull", "PR"),
+        (response.issueLink, "issues", "issue"),
+    ):
+        if link and not re.fullmatch(
+            rf"https://github\.com/[^/\s]+/[^/\s]+/{kind}/[1-9][0-9]*", link,
+        ):
+            raise ValueError(f"Invalid remediation {label} URL")
     return response
 
 

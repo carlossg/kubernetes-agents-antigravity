@@ -4,6 +4,7 @@ import os
 import re
 
 import httpx
+from pydantic import ValidationError
 
 from agents.contracts import AnalysisResult, EvidenceBundle
 
@@ -78,7 +79,15 @@ class AnalysisAgent:
             text = "".join(
                 p.get("text", "") for p in parts if not p.get("thought")
             )
-            return AnalysisResult.model_validate_json(text)
+            try:
+                return AnalysisResult.model_validate_json(text)
+            except ValidationError as exc:
+                errors = exc.errors()
+                if errors and all(e.get("loc") == ("summary",) and e.get("type") == "string_too_long" for e in errors):
+                    parsed = json.loads(text)
+                    parsed["summary"] = parsed["summary"][:117].rstrip() + "..."
+                    return AnalysisResult.model_validate(parsed)
+                raise
 
         if http_client is not None:
             return await send(http_client)

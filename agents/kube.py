@@ -31,23 +31,29 @@ def list_pods(api, namespace: str, selector: str):
     return [p for p in pods.items if p.metadata.deletion_timestamp is None]
 
 
+def _container_diagnostics(statuses) -> list[dict]:
+    return [
+        {
+            "name": s.name,
+            "ready": s.ready,
+            "restarts": s.restart_count,
+            "waiting": s.state.waiting.reason if s.state and s.state.waiting else None,
+            "lastTermination": (
+                s.last_state.terminated.reason
+                if s.last_state and s.last_state.terminated else None
+            ),
+        }
+        for s in statuses
+    ]
+
+
 def pod_diagnostics(pod) -> dict:
     statuses = pod.status.container_statuses or []
+    init_statuses = getattr(pod.status, "init_container_statuses", None) or []
     return {
         "name": pod.metadata.name,
         "uid": pod.metadata.uid,
         "phase": pod.status.phase,
-        "containers": [
-            {
-                "name": s.name,
-                "ready": s.ready,
-                "restarts": s.restart_count,
-                "waiting": s.state.waiting.reason if s.state and s.state.waiting else None,
-                "lastTermination": (
-                    s.last_state.terminated.reason
-                    if s.last_state and s.last_state.terminated else None
-                ),
-            }
-            for s in statuses
-        ],
+        "containers": _container_diagnostics(statuses),
+        "initContainers": _container_diagnostics(init_statuses),
     }

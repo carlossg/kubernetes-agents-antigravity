@@ -8,13 +8,11 @@ from kubernetes.config.config_exception import ConfigException
 from urllib3.exceptions import HTTPError as KubernetesHTTPError
 
 from agents import activity
-from agents.contracts import EvidenceBundle, EvidenceReport
+from agents.contracts import COLLECTOR_TIMEOUT, EvidenceBundle, EvidenceReport
 from agents.events import EventAnalystAgent
 from agents.kube import REQUEST_TIMEOUT, ensure_config, validate_namespace
 from agents.logs import LogAnalystAgent
 from agents.metrics import MetricsDataAgent
-
-COLLECTOR_TIMEOUT = 150.0
 
 
 async def collect_report(name: str, url: str | None, path: str, local, payload: dict) -> EvidenceReport:
@@ -47,9 +45,14 @@ class DiagnosticsDataAgent:
             collect_report("PodDiagnosticsCollector", os.getenv("EVENTS_AGENT_URL"), "/analyze/events",
                            lambda: EventAnalystAgent().collect(*args), payload),
         )
+        data = {}
+        if logs.data:
+            data["logs"] = logs.model_dump()
+        if pods.data:
+            data["pods"] = pods.model_dump()
         return EvidenceReport(
             source="diagnostics",
-            data={"logs": logs.model_dump(), "pods": pods.model_dump()},
+            data=data,
             errors=logs.errors + pods.errors, warnings=logs.warnings + pods.warnings,
         )
 

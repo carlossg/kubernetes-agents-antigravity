@@ -6,12 +6,16 @@ import re
 import time
 
 from kubernetes import client
+from urllib3.exceptions import HTTPError as KubernetesHTTPError
 
 from agents import activity
-from agents.contracts import EvidenceReport
+from agents.contracts import COLLECTOR_TIMEOUT, EvidenceReport
 from agents.kube import REQUEST_TIMEOUT, ensure_config, list_pods
 
+SAMPLING_TIMEOUT_SECONDS = COLLECTOR_TIMEOUT - 25.0
+COLLECTION_DEADLINE_SECONDS = COLLECTOR_TIMEOUT - 5.0
 SAMPLE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*(?:\{.*\})?)\s+(\S+)(?:\s+\S+)?$')
+LABEL_PAIR = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"((?:\\.|[^"\\])*)"(?:\s*,\s*|\s*$)')
 COUNTERS = {
     "http_requests_total": "requests",
     "http_requests_success_total": "successes",
@@ -19,6 +23,30 @@ COUNTERS = {
     "http_request_duration_seconds_sum": "latencySumSeconds",
     "http_request_duration_seconds_count": "latencyCount",
 }
+
+
+def _canonicalize_series(series: str) -> tuple[str, str, dict[str, str]]:
+    if "{" not in series:
+        return series, series, {}
+    name, rest = series.split("{", 1)
+    if not rest.endswith("}"):
+        raise ValueError("Malformed application metric sample")
+    inner = rest[:-1].strip()
+    if not inner:
+        return name, name, {}
+    labels = {}
+    pos = 0
+    while pos < len(inner):
+        match = LABEL_PAIR.match(inner, pos)
+        if not match:
+            raise ValueError("Malformed application metric sample")
+        label_name, label_value = match.groups()
+        if label_name in labels:
+            raise ValueError(f"Duplicate label in metric series: {series}")
+        labels[label_name] = label_value
+        pos = match.end()
+    canonical_labels = ",".join(f'{k}="{v}"' for k, v in sorted(labels.items()))
+    return name, f"{name}{{{canonical_labels}}}", labels
 
 
 def parse_application_metrics(text: str) -> dict:
@@ -38,16 +66,17 @@ def parse_application_metrics(text: str) -> dict:
         value = float(raw)
         if not math.isfinite(value) or value < 0:
             raise ValueError(f"Invalid application metric value: {name}")
+        _, canonical, labels = _canonicalize_series(series)
         if name in COUNTERS:
-            if series in counters:
-                raise ValueError(f"Duplicate application metric series: {series}")
-            counters[series] = value
+            if canonical in counters:
+                raise ValueError(f"Duplicate application metric series: {canonical}")
+            counters[canonical] = value
         else:
-            for quantile in ("0.95", "0.99"):
-                if f'quantile="{quantile}"' in series:
-                    key = f"p{quantile[2:]}Ms"
-                    # Individual summary quantiles cannot be averaged into a fleet percentile.
-                    gauges[key] = max(gauges.get(key, 0), value * 1000)
+            quantile = labels.get("quantile")
+            if quantile in ("0.95", "0.99"):
+                key = f"p{quantile[2:]}Ms"
+                # Individual summary quantiles cannot be averaged into a fleet percentile.
+                gauges[key] = max(gauges.get(key, 0), value * 1000)
     if not any(k.split("{", 1)[0] == "http_requests_total" for k in counters):
         raise ValueError("Application endpoint has no http_requests_total counter")
     return {"counters": counters, "maxPodQuantiles": gauges}
@@ -67,6 +96,9 @@ def window_metrics(first: dict, latest: dict, seconds: float, excluded: set[str]
         before = first.get(pod_key)
         if before is None:
             warnings.append(f"{pod_key}: new pod, no baseline")
+            continue
+        if before.get("restartCount", 0) != after.get("restartCount", 0):
+            warnings.append(f"{pod_key}: container restart observed; excluded from window")
             continue
         old, new = before["counters"], after["counters"]
         if old.keys() != new.keys() or any(new[k] < old[k] for k in old.keys() & new.keys()):
@@ -89,13 +121,17 @@ def window_metrics(first: dict, latest: dict, seconds: float, excluded: set[str]
             errors += pod_errors
         requests += pod_requests
         usable += 1
-        count = deltas.get("latencyCount", 0)
-        if count > 0 and "latencySumSeconds" in deltas:
-            latency_sum += deltas["latencySumSeconds"]
-            latency_count += count
-            mean = deltas["latencySumSeconds"] / count * 1000
-            if worst_latency is None or mean > worst_latency:
-                worst_latency, worst_pod = mean, pod_key
+        if "latencyCount" in deltas and "latencySumSeconds" in deltas:
+            count = deltas["latencyCount"]
+            latency_delta = deltas["latencySumSeconds"]
+            if count > 0:
+                latency_sum += latency_delta
+                latency_count += count
+                mean = latency_delta / count * 1000
+                if worst_latency is None or mean > worst_latency:
+                    worst_latency, worst_pod = mean, pod_key
+            elif count != 0 or latency_delta != 0 or pod_requests != 0:
+                has_latency = False
         else:
             has_latency = False
     for pod_key in first.keys() - latest.keys():
@@ -120,7 +156,10 @@ def scrape_application_metrics(namespace: str, selector: str) -> tuple[dict, lis
     api = client.CoreV1Api()
     snapshots = {}
     errors = []
-    pods = list_pods(api, namespace, selector)
+    try:
+        pods = list_pods(api, namespace, selector)
+    except (client.ApiException, KubernetesHTTPError, OSError) as exc:
+        return {}, [f"Pod listing unavailable for {selector}: {exc}"]
     if not pods:
         return {}, [f"No pods match {selector}"]
     port = int(os.getenv("APPLICATION_METRICS_PORT", "8080"))
@@ -138,7 +177,7 @@ def scrape_application_metrics(namespace: str, selector: str) -> tuple[dict, lis
             snapshots[key]["restartCount"] = sum(
                 s.restart_count for s in (pod.status.container_statuses or [])
             )
-        except (client.ApiException, ValueError) as exc:
+        except (client.ApiException, KubernetesHTTPError, OSError, ValueError) as exc:
             errors.append(f"{pod.metadata.name}: application metrics unavailable: {exc}")
     return snapshots, errors
 
@@ -174,61 +213,89 @@ class MetricsDataAgent:
         async def scrape(selector):
             return await asyncio.to_thread(scrape_application_metrics, namespace, selector)
 
-        initial = await asyncio.gather(*(scrape(s) for s in selectors.values()))
+        start = time.monotonic()
+        sampling_deadline = start + SAMPLING_TIMEOUT_SECONDS
+        total_deadline = start + COLLECTION_DEADLINE_SECONDS
+        baseline_timed_out = False
+        try:
+            async with asyncio.timeout(max(0.01, sampling_deadline - time.monotonic())):
+                initial = await asyncio.gather(*(scrape(s) for s in selectors.values()))
+        except TimeoutError:
+            baseline_timed_out = True
+            initial = [({}, []), ({}, [])]
+            report.errors.append("metrics baseline timed out at collection deadline")
         baseline = {side: pair[0] for side, pair in zip(selectors, initial)}
-        previous = dict(baseline)
+        initial_errors = {side: list(pair[1]) for side, pair in zip(selectors, initial)}
+        previous = {side: dict(snap) for side, snap in baseline.items()}
         invalid_pods = {side: set() for side in selectors}
         for side, (_, errors) in zip(selectors, initial):
             report.errors.extend(f"{side}: {e}" for e in errors)
-        start = time.monotonic()
-        for attempt in range(waits + 1):
-            await asyncio.sleep(seconds)
-            samples = await asyncio.gather(*(scrape(s) for s in selectors.values()))
-            elapsed = time.monotonic() - start
-            for side, (snapshot, errors) in zip(selectors, samples):
-                report.errors.extend(f"{side}: {e}" for e in errors)
-                for pod, sample in snapshot.items():
-                    if pod in previous[side]:
-                        prior = previous[side][pod]
-                        old, new = prior["counters"], sample["counters"]
-                        if (old.keys() != new.keys()
-                                or any(new[k] < old[k] for k in old.keys() & new.keys())
-                                or sample.get("restartCount", 0) != prior.get("restartCount", 0)):
-                            invalid_pods[side].add(pod)
-                previous[side] = snapshot
-                window = window_metrics(baseline[side], snapshot, elapsed, invalid_pods[side])
-                report.data[side] = {
-                    **window,
-                    "sampleSufficient": window["complete"] and (window["windowRequests"] or 0) >= minimum,
-                    "minRequests": minimum,
-                    "maxPodQuantiles": {
-                        pod: sample["maxPodQuantiles"] for pod, sample in snapshot.items()
-                    },
-                }
-                report.warnings.extend(f"{side}: {w}" for w in window["warnings"])
-            if report.data["canary"]["sampleSufficient"]:
-                break
-            if attempt < waits:
-                activity.feed.emit(activity.TOOL_RESULT, "Gathering more canary evidence",
-                                   f"requests={report.data['canary']['windowRequests']} minimum={minimum}")
+        if not baseline_timed_out:
+            for attempt in range(waits + 1):
+                remaining = sampling_deadline - time.monotonic()
+                if remaining <= 0:
+                    report.warnings.append("metrics sampling stopped at collection deadline")
+                    break
+                try:
+                    async with asyncio.timeout(remaining):
+                        await asyncio.sleep(seconds)
+                        samples = await asyncio.gather(*(scrape(s) for s in selectors.values()))
+                except TimeoutError:
+                    report.warnings.append("metrics sampling stopped at collection deadline")
+                    break
+                elapsed = time.monotonic() - start
+                for side, (snapshot, errors) in zip(selectors, samples):
+                    report.errors.extend(f"{side}: {e}" for e in errors)
+                    for pod, sample in snapshot.items():
+                        if pod in previous[side]:
+                            prior = previous[side][pod]
+                            old, new = prior["counters"], sample["counters"]
+                            if (old.keys() != new.keys()
+                                    or any(new[k] < old[k] for k in old.keys() & new.keys())
+                                    or sample.get("restartCount", 0) != prior.get("restartCount", 0)):
+                                invalid_pods[side].add(pod)
+                        previous[side][pod] = sample
+                    window = window_metrics(baseline[side], snapshot, elapsed, invalid_pods[side])
+                    full_coverage = bool(snapshot) and not initial_errors[side] and not errors
+                    report.data[side] = {
+                        **window,
+                        "sampleSufficient": window["complete"] and full_coverage and (window["windowRequests"] or 0) >= minimum,
+                        "minRequests": minimum,
+                        "maxPodQuantiles": {
+                            pod: sample["maxPodQuantiles"] for pod, sample in snapshot.items()
+                        },
+                    }
+                    report.warnings.extend(f"{side}: {w}" for w in window["warnings"])
+                if report.data["canary"]["sampleSufficient"]:
+                    break
+                if attempt < waits:
+                    activity.feed.emit(activity.TOOL_RESULT, "Gathering more canary evidence",
+                                       f"requests={report.data['canary']['windowRequests']} minimum={minimum}")
         for side, selector in selectors.items():
-            if not report.data[side]["sampleSufficient"]:
+            if side in report.data and not report.data[side]["sampleSufficient"]:
                 report.warnings.append(f"{side}: insufficient or incomplete request window")
+            remaining = total_deadline - time.monotonic()
+            if remaining <= 0:
+                report.errors.append(f"{side}: resource snapshot skipped at collection deadline")
+                continue
             try:
-                report.data[side]["resources"] = await asyncio.to_thread(
-                    fetch_kubernetes_pod_metrics, namespace, selector,
-                )
-            except (client.ApiException, ValueError) as exc:
+                async with asyncio.timeout(remaining):
+                    resources = await asyncio.to_thread(
+                        fetch_kubernetes_pod_metrics, namespace, selector,
+                    )
+                report.data.setdefault(side, {})["resources"] = resources
+            except (client.ApiException, KubernetesHTTPError, OSError, ValueError, TimeoutError) as exc:
                 report.errors.append(f"{side}: resource snapshot unavailable: {exc}")
-        stable, canary = report.data["stable"], report.data["canary"]
-        report.data["comparisons"] = {}
-        for key in ("windowErrorRate", "windowMeanLatencyMs", "windowWorstPodMeanLatencyMs"):
-            a, b = stable[key], canary[key]
-            if a is not None and b is not None:
-                report.data["comparisons"][key] = {
-                    "stable": a, "canary": b, "delta": b - a,
-                    "ratio": b / a if a > 0 else None,
-                }
+        if "stable" in report.data and "canary" in report.data:
+            stable, canary = report.data["stable"], report.data["canary"]
+            report.data["comparisons"] = {}
+            for key in ("windowErrorRate", "windowMeanLatencyMs", "windowWorstPodMeanLatencyMs"):
+                a, b = stable.get(key), canary.get(key)
+                if a is not None and b is not None:
+                    report.data["comparisons"][key] = {
+                        "stable": a, "canary": b, "delta": b - a,
+                        "ratio": b / a if a > 0 else None,
+                    }
         return report
 
 

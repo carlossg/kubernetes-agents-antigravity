@@ -2,6 +2,7 @@
 import asyncio
 
 from kubernetes import client
+from urllib3.exceptions import HTTPError as KubernetesHTTPError
 
 from agents.contracts import EvidenceReport
 from agents.kube import REQUEST_TIMEOUT, ensure_config, list_pods, pod_diagnostics
@@ -12,20 +13,31 @@ def collect_events(namespace: str, stable_selector: str, canary_selector: str) -
     api = client.CoreV1Api()
     report = EvidenceReport(source="pod_diagnostics")
     for side, selector in (("stable", stable_selector), ("canary", canary_selector)):
-        pods = list_pods(api, namespace, selector)
+        try:
+            pods = list_pods(api, namespace, selector)
+        except (client.ApiException, KubernetesHTTPError, OSError) as exc:
+            report.errors.append(f"{side}: pods unavailable: {exc}")
+            continue
         if not pods:
             report.errors.append(f"No {side} pods match {selector}")
             continue
         report.data[side] = {"pods": [pod_diagnostics(p) for p in pods], "events": []}
         for pod in pods:
-            events = api.list_namespaced_event(
-                namespace, field_selector=f"involvedObject.uid={pod.metadata.uid}",
-                _request_timeout=REQUEST_TIMEOUT,
-            )
+            try:
+                events = api.list_namespaced_event(
+                    namespace, field_selector=f"involvedObject.uid={pod.metadata.uid}",
+                    _request_timeout=REQUEST_TIMEOUT,
+                )
+            except (client.ApiException, KubernetesHTTPError, OSError) as exc:
+                report.errors.append(f"{side}: {pod.metadata.name} events unavailable: {exc}")
+                continue
             # Restrict evidence to these pod UIDs, not unrelated namespace warnings.
             recent = sorted(
                 events.items,
-                key=lambda e: str(e.last_timestamp or e.event_time or e.metadata.creation_timestamp or ""),
+                key=lambda e: str(
+                    getattr(getattr(e, "series", None), "last_observed_time", None)
+                    or e.last_timestamp or e.event_time or e.metadata.creation_timestamp or ""
+                ),
                 reverse=True,
             )[:20]
             report.data[side]["events"].extend(

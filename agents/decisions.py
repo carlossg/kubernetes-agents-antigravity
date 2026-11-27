@@ -33,7 +33,7 @@ class AnalysisGrade:
         return self.supported < CLEARLY_UNSUPPORTED
 
     def effective_confidence(self, self_reported: int) -> int:
-        return int(self.supported * 100 + 0.5) if self.disputed else self_reported
+        return min(self_reported, int(self.supported * 100 + 0.5)) if self.disputed else self_reported
 
 
 def build_grading_questions() -> dict[str, dict[str, Any]]:
@@ -75,7 +75,7 @@ def parse_grade(data: dict[str, Any]) -> AnalysisGrade:
         value = answer.get("noul")
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"Invalid probability for {key}")
-        if not math.isfinite(value) or not 0.01 <= value <= 0.99:
+        if not (0.01 <= value <= 0.99) or not math.isfinite(value):
             raise ValueError(f"Out-of-range probability for {key}")
         values.append(float(value))
     return AnalysisGrade(*values)

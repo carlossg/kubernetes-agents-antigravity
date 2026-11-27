@@ -1,12 +1,13 @@
 """An opt-in hold for uncertain promotion; failed writes are never reported as pauses."""
 import asyncio
+import threading
 
 from kubernetes import client
 
 from agents.kube import REQUEST_TIMEOUT, ensure_config, validate_namespace
 
 
-def _pause_rollout(namespace: str, rollout_name: str) -> str:
+def _pause_rollout(namespace: str, rollout_name: str, cancelled: threading.Event | None = None) -> str:
     validate_namespace(namespace)
     ensure_config()
     api = client.CustomObjectsApi()
@@ -16,6 +17,8 @@ def _pause_rollout(namespace: str, rollout_name: str) -> str:
     }
     rollout = api.get_namespaced_custom_object(**arguments)
     if not rollout.get("spec", {}).get("paused"):
+        if cancelled is not None and cancelled.is_set():
+            raise RuntimeError("Rollout pause cancelled before write")
         api.patch_namespaced_custom_object(**arguments, body={"spec": {"paused": True}})
         rollout = api.get_namespaced_custom_object(**arguments)
     if rollout.get("spec", {}).get("paused") is not True:
@@ -24,4 +27,9 @@ def _pause_rollout(namespace: str, rollout_name: str) -> str:
 
 
 async def pause_rollout(namespace: str, rollout_name: str) -> str:
-    return await asyncio.to_thread(_pause_rollout, namespace, rollout_name)
+    cancelled = threading.Event()
+    try:
+        return await asyncio.to_thread(_pause_rollout, namespace, rollout_name, cancelled)
+    except BaseException:
+        cancelled.set()
+        raise

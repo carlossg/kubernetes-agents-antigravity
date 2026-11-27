@@ -42,6 +42,7 @@ def get_first_pod_logs(namespace: str, label_selector: str) -> str:
 
     logs = v1.read_namespaced_pod_log(
         pod_name, namespace, container=container_name, tail_lines=200,
-        limit_bytes=48_000, _request_timeout=10,
+        _request_timeout=10,
     )
+    logs = (logs or "")[-48_000:]
     return f"--- LOGS FOR POD {pod_name} ({label_selector}) ---\n{logs}"

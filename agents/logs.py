@@ -22,13 +22,23 @@ def fetch_kubernetes_pod_logs(namespace: str, label_selector: str) -> str:
     return response.json()["logs"]
 
 
+def _truncate_logs(logs: str) -> str:
+    if len(logs) <= MAX_LOG_CHARS:
+        return logs
+    if logs.startswith("--- LOGS FOR POD "):
+        header, sep, body = logs.partition("\n")
+        if sep and len(header) + len(sep) < MAX_LOG_CHARS:
+            return header + sep + body[-(MAX_LOG_CHARS - len(header) - len(sep)):]
+    return logs[-MAX_LOG_CHARS:]
+
+
 class LogAnalystAgent:
     async def collect(self, namespace: str, stable_selector: str, canary_selector: str) -> EvidenceReport:
         report = EvidenceReport(source="logs")
         for side, selector in (("stable", stable_selector), ("canary", canary_selector)):
             try:
                 logs = await asyncio.to_thread(fetch_kubernetes_pod_logs, namespace, selector)
-                report.data[side] = logs[:MAX_LOG_CHARS]
+                report.data[side] = _truncate_logs(logs)
                 if len(logs) > MAX_LOG_CHARS:
                     report.warnings.append(f"{side} logs truncated to {MAX_LOG_CHARS} characters")
             except (httpx.HTTPError, ValueError, KeyError) as exc:

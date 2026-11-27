@@ -94,9 +94,25 @@ class RemediationTests(unittest.IsolatedAsyncioTestCase):
                 await call_remediation(request(), "http://remote", http_client=http)
 
     async def test_missing_or_untrusted_artifact_never_claims_success(self):
-        for link in (None, "https://evil.example/pull/1", "https://github.com/o/r/not-pull/1"):
+        for link in (
+            None,
+            "https://evil.example/pull/1",
+            "https://github.com/o/r/not-pull/1",
+            "https://github.com/o/r/issues/1",
+        ):
             with self.subTest(link=link), self.assertRaises(ValueError):
                 parse_artifact(artifact(link=link))
+        with self.assertRaises(ValueError):
+            parse_artifact({"kind": "message", "parts": [{"kind": "text", "text": json.dumps({
+                "status": "issue", "issueLink": "https://github.com/o/r/pull/1",
+            })}]})
+
+    async def test_multiple_artifacts_parses_only_final_artifact(self):
+        result = {"task": {"id": "task-1", "status": {"state": "TASK_STATE_COMPLETED"}, "artifacts": [
+            {"parts": [{"text": "Cloning repository and running tests..."}]},
+            {"parts": [{"text": json.dumps({"status": "success", "prLink": "https://github.com/o/r/pull/7"})}]},
+        ]}}
+        self.assertEqual(parse_artifact(result).prLink, "https://github.com/o/r/pull/7")
 
     @patch.dict(os.environ, {"REMEDIATION_AGENT_URL": "http://remote/a2a"}, clear=True)
     async def test_delegation_returns_without_waiting_and_shutdown_cancels(self):

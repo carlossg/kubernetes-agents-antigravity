@@ -3,6 +3,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+COLLECTOR_TIMEOUT = 150.0
+
 
 class EvidenceReport(BaseModel):
     source: str

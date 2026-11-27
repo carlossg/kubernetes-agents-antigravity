@@ -29,11 +29,14 @@ class AnalysisOrchestratorAgent:
         if self.grading_mode not in {"shadow", "enforce"}:
             raise ValueError("DECISION_GRADING_MODE must be shadow or enforce")
 
-    async def _grade(self, result: AnalysisResult, evidence: EvidenceBundle) -> AnalysisGrade | None:
+    async def _grade(
+        self, result: AnalysisResult, evidence: EvidenceBundle,
+        fallback_message: str = "Grader unavailable; using self-reported confidence",
+    ) -> AnalysisGrade | None:
         try:
             grade = await grade_analysis(result, evidence, model=self.decision_model)
         except (httpx.HTTPError, ValueError) as exc:
-            activity.feed.emit(activity.ERROR, "Grader unavailable; using self-reported confidence", str(exc))
+            activity.feed.emit(activity.ERROR, fallback_message, str(exc))
             return None
         activity.feed.emit(
             activity.QUALITY_CHECKED,
@@ -77,9 +80,14 @@ class AnalysisOrchestratorAgent:
             except (httpx.HTTPError, ValueError) as exc:
                 activity.feed.emit(activity.ERROR, "Second opinion unavailable; retaining primary conclusion", str(exc))
             else:
-                result = escalated
-                model_results.append({"modelName": self.second_opinion_model, **result.model_dump()})
-                grade = await self._grade(result, evidence)
+                regrade = await self._grade(
+                    escalated, evidence,
+                    fallback_message="Grader unavailable for second opinion; retaining primary conclusion and grade",
+                )
+                if regrade is not None:
+                    result = escalated
+                    model_results.append({"modelName": self.second_opinion_model, **result.model_dump()})
+                    grade = regrade
 
         effective = (
             grade.effective_confidence(result.confidence)

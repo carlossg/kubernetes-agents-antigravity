@@ -2,6 +2,7 @@ import asyncio
 import json
 import math
 import os
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -9,15 +10,16 @@ from unittest.mock import AsyncMock, patch
 import httpx
 from kubernetes import client
 from pydantic import ValidationError
+from urllib3.exceptions import HTTPError as KubernetesHTTPError
 
 from agents import activity
 from agents.analysis import AnalysisAgent, SecondOpinionAnalysisAgent
 from agents.contracts import AnalysisResult, EvidenceBundle, EvidenceReport
-from agents.data import AnalysisDataAgent, RolloutStatusDataAgent, collect_report
+from agents.data import AnalysisDataAgent, DiagnosticsDataAgent, RolloutStatusDataAgent, collect_report
 from agents.decisions import AnalysisGrade, grade_analysis, parse_grade
 from agents.events import collect_events
 from agents.log_proxy import get_first_pod_logs
-from agents.logs import LogAnalystAgent, fetch_kubernetes_pod_logs
+from agents.logs import MAX_LOG_CHARS, LogAnalystAgent, fetch_kubernetes_pod_logs
 from agents.metrics import MetricsDataAgent, parse_application_metrics, scrape_application_metrics, window_metrics
 from agents.orchestrator import LeadOrchestratorAgent
 from agents.pause import _pause_rollout
@@ -135,7 +137,7 @@ class ModelAdapterTests(unittest.IsolatedAsyncioTestCase):
 
     def test_missing_blocked_wrong_type_and_nonfinite_grades_rejected(self):
         bad = [{}, {"prompt_feedback": {"block_reason": "SAFETY"}}, {"answers": {}}, []]
-        for value in (None, True, "0.9", math.nan, math.inf, 0, 1, -0.5):
+        for value in (None, True, "0.9", math.nan, math.inf, 0, 1, -0.5, 10**400):
             bad.append(grade_payload(value))
         wrong_type = grade_payload()
         wrong_type["answers"]["conclusion_contradicted"]["type"] = "choice"
@@ -151,6 +153,20 @@ class ModelAdapterTests(unittest.IsolatedAsyncioTestCase):
         disputed = AnalysisGrade(0.90, 0.99)
         self.assertTrue(disputed.disputed)
         self.assertEqual(disputed.effective_confidence(96), 3)
+        self.assertEqual(AnalysisGrade(0.50, 0.99).effective_confidence(5), 5)
+
+    @patch.dict(os.environ, {"GEMINI_API_KEY": "test"}, clear=True)
+    async def test_overlong_summary_recovers_without_losing_verdict(self):
+        payload = {**analysis(False).model_dump(), "summary": "S" * 140}
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json={"candidates": [{
+                "finishReason": "STOP", "content": {"parts": [{"text": json.dumps(payload)}]},
+            }]}),
+        )) as http:
+            result = await AnalysisAgent().analyze(evidence(), http_client=http)
+        self.assertFalse(result.promote)
+        self.assertLessEqual(len(result.summary), 120)
+        self.assertTrue(result.summary.endswith("..."))
 
     def test_invalid_analysis_not_coerced_or_inconsistent(self):
         for update in ({"promote": "false"}, {"confidence": 101}, {"issueCategory": "CODE_BUG"}):
@@ -238,6 +254,73 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         report = await collect_report("rollout", None, "", fail, {})
         self.assertEqual(report.status, "unavailable")
         self.assertIn("403", report.errors[0])
+
+    @patch.dict(os.environ, {}, clear=True)
+    async def test_logs_truncate_from_oldest_end_preserving_header_and_newest_trace(self):
+        header = "--- LOGS FOR POD canary-1 (role=canary) ---\n"
+        raw = header + ("old line\n" * 4000) + "ERROR NullPointerException"
+        with patch("agents.logs.fetch_kubernetes_pod_logs", side_effect=[raw, "ok"]):
+            report = await LogAnalystAgent().collect("ns", "role=stable", "role=canary")
+        self.assertEqual(report.status, "ok")
+        self.assertTrue(report.data["stable"].startswith(header))
+        self.assertTrue(report.data["stable"].endswith("ERROR NullPointerException"))
+        self.assertLessEqual(len(report.data["stable"]), MAX_LOG_CHARS)
+        self.assertTrue(any("truncated" in w for w in report.warnings))
+
+    @patch.dict(os.environ, {}, clear=True)
+    async def test_diagnostics_unavailable_when_both_collectors_fail(self):
+        with patch("agents.data.collect_report", AsyncMock(side_effect=[
+            EvidenceReport(source="logs", errors=["logs down"]),
+            EvidenceReport(source="pod_diagnostics", errors=["events down"]),
+        ])):
+            report = await DiagnosticsDataAgent().collect({
+                "namespace": "ns", "stableSelector": "stable", "canarySelector": "canary",
+            })
+        self.assertEqual(report.status, "unavailable")
+        self.assertEqual(report.data, {})
+        self.assertEqual(len(report.errors), 2)
+
+    @patch("agents.events.ensure_config")
+    @patch("agents.events.client.CoreV1Api")
+    def test_events_preserve_pod_diagnostics_on_query_failure_and_rank_series(self, factory, config):
+        init_status = SimpleNamespace(
+            name="init-db", ready=False, restart_count=0,
+            state=SimpleNamespace(waiting=SimpleNamespace(reason="ImagePullBackOff")),
+            last_state=None,
+        )
+        stable_pod = SimpleNamespace(
+            metadata=SimpleNamespace(name="stable-1", uid="uid-s", deletion_timestamp=None),
+            status=SimpleNamespace(phase="Running", container_statuses=[], init_container_statuses=[]),
+        )
+        canary_pod = SimpleNamespace(
+            metadata=SimpleNamespace(name="canary-1", uid="uid-c", deletion_timestamp=None),
+            status=SimpleNamespace(phase="Pending", container_statuses=[], init_container_statuses=[init_status]),
+        )
+        older = SimpleNamespace(
+            type="Normal", reason="Scheduled", message="older", count=1,
+            series=None, last_timestamp="2026-11-27T09:30:00Z", event_time=None,
+            metadata=SimpleNamespace(creation_timestamp="2026-11-27T09:00:00Z"),
+        )
+        recurring = SimpleNamespace(
+            type="Warning", reason="BackOff", message="newer series", count=5,
+            series=SimpleNamespace(last_observed_time="2026-11-27T10:00:00Z"),
+            last_timestamp="2026-11-27T09:00:00Z", event_time=None,
+            metadata=SimpleNamespace(creation_timestamp="2026-11-27T09:00:00Z"),
+        )
+        api = factory.return_value
+        api.list_namespaced_pod.side_effect = [
+            SimpleNamespace(items=[stable_pod]),
+            SimpleNamespace(items=[canary_pod]),
+        ]
+        api.list_namespaced_event.side_effect = [
+            SimpleNamespace(items=[older, recurring]),
+            KubernetesHTTPError("events 503"),
+        ]
+        report = collect_events("ns", "stable", "canary")
+        self.assertEqual(report.status, "partial")
+        self.assertEqual(report.data["stable"]["events"][0]["reason"], "BackOff")
+        self.assertEqual(report.data["canary"]["pods"][0]["initContainers"][0]["waiting"], "ImagePullBackOff")
+        self.assertIn("canary-1 events unavailable", report.errors[0])
 
 
 class MetricsTests(unittest.IsolatedAsyncioTestCase):
@@ -363,6 +446,93 @@ http_request_duration_seconds{quantile="0.95"} 0.1
         self.assertIsNone(report.data["canary"]["windowRequests"])
         self.assertTrue(any("discontinuity" in w for w in report.warnings))
 
+    def test_idle_pod_and_reordered_labels_preserve_fleet_latency(self):
+        first_a = parse_application_metrics(
+            'http_requests_total{route="/a",method="GET"} 100\n'
+            'http_requests_error_total 0\n'
+            'http_request_duration_seconds_sum 1\n'
+            'http_request_duration_seconds_count 100\n'
+        )
+        latest_a = parse_application_metrics(
+            'http_requests_total{method="GET",route="/a"} 700\n'
+            'http_requests_error_total 0\n'
+            'http_request_duration_seconds_sum 13\n'
+            'http_request_duration_seconds_count 700\n'
+        )
+        idle = counters(50, latency_sum=1, latency_count=50)
+        result = window_metrics({"a": first_a, "b": idle}, {"a": latest_a, "b": idle}, 10)
+        self.assertEqual(result["windowRequests"], 600)
+        self.assertEqual(result["windowMeanLatencyMs"], 20)
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["warnings"], [])
+
+    @patch.dict(os.environ, {"ANALYSIS_MAX_SAMPLE_WAITS": "1"}, clear=True)
+    @patch("agents.metrics.ensure_config")
+    @patch("agents.metrics.asyncio.sleep", new_callable=AsyncMock)
+    @patch("agents.metrics.fetch_kubernetes_pod_metrics", return_value={})
+    @patch("agents.metrics.scrape_application_metrics")
+    async def test_missed_scrape_preserves_prior_restart_count_and_coverage(self, scrape, resources, sleep, config):
+        p0 = {**counters(100), "restartCount": 0}
+        p1 = {**counters(800), "restartCount": 1}
+        stable_seq = [({"s": counters(100)}, []), ({"s": counters(700)}, []), ({"s": counters(1300)}, [])]
+        canary_seq = [({"p": p0}, []), ({}, ["p: missed"]), ({"p": p1}, [])]
+        idx = {"stable": 0, "canary": 0}
+
+        def snapshot(namespace, selector):
+            i = idx[selector]
+            idx[selector] += 1
+            return (stable_seq if selector == "stable" else canary_seq)[i]
+
+        scrape.side_effect = snapshot
+        report = await MetricsDataAgent().collect("ns", "stable", "canary")
+        self.assertFalse(report.data["canary"]["sampleSufficient"])
+        self.assertIsNone(report.data["canary"]["windowRequests"])
+        self.assertTrue(any("discontinuity" in w for w in report.warnings))
+
+    @patch.dict(os.environ, {"ANALYSIS_MAX_SAMPLE_WAITS": "0"}, clear=True)
+    @patch("agents.metrics.ensure_config")
+    @patch("agents.metrics.asyncio.sleep", new_callable=AsyncMock)
+    @patch("agents.metrics.fetch_kubernetes_pod_metrics", side_effect=KubernetesHTTPError("metrics API down"))
+    @patch("agents.metrics.scrape_application_metrics")
+    async def test_partial_pod_coverage_insufficient_and_resource_http_error_keeps_windows(self, scrape, resources, sleep, config):
+        idx = {"stable": 0, "canary": 0}
+
+        def snapshot(namespace, selector):
+            idx[selector] += 1
+            if selector == "canary":
+                return {"a": counters(idx[selector] * 600)}, ["b: application metrics unavailable"]
+            return {"s": counters(idx[selector] * 600)}, []
+
+        scrape.side_effect = snapshot
+        report = await MetricsDataAgent().collect("ns", "stable", "canary")
+        self.assertEqual(report.data["canary"]["windowRequests"], 600)
+        self.assertFalse(report.data["canary"]["sampleSufficient"])
+        self.assertTrue(report.data["stable"]["sampleSufficient"])
+        self.assertEqual(report.status, "partial")
+        self.assertTrue(any("resource snapshot unavailable" in e for e in report.errors))
+
+    @patch.dict(os.environ, {"ANALYSIS_MAX_SAMPLE_WAITS": "3"}, clear=True)
+    @patch("agents.metrics.SAMPLING_TIMEOUT_SECONDS", 0.05)
+    @patch("agents.metrics.ensure_config")
+    @patch("agents.metrics.fetch_kubernetes_pod_metrics", return_value={})
+    @patch("agents.metrics.scrape_application_metrics")
+    async def test_sampling_deadline_preserves_completed_round(self, scrape, resources, config):
+        counts = {"stable": 0, "canary": 0}
+        real_sleep = asyncio.sleep
+
+        def snapshot(namespace, selector):
+            counts[selector] += 1
+            return {"p": counters(counts[selector] * 200)}, []
+
+        async def paced_sleep(_):
+            await real_sleep(0.03)
+
+        scrape.side_effect = snapshot
+        with patch("agents.metrics.asyncio.sleep", side_effect=paced_sleep):
+            report = await MetricsDataAgent().collect("ns", "stable", "canary")
+        self.assertEqual(report.data["canary"]["windowRequests"], 200)
+        self.assertTrue(any("collection deadline" in w for w in report.warnings))
+
 
 class PipelineTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -468,6 +638,23 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result["modelResults"]), 1)
         grader.assert_awaited_once()
 
+    async def test_second_opinion_regrade_failure_preserves_primary_and_disputed_grade(self):
+        with patch.dict(os.environ, {"ANALYSIS_SECOND_OPINION_MODEL": "gemini-4-argon"}), patch(
+            "agents.orchestrator.AnalysisAgent.analyze", AsyncMock(return_value=analysis(True, confidence=92)),
+        ), patch(
+            "agents.orchestrator.SecondOpinionAnalysisAgent.analyze", AsyncMock(return_value=analysis(True, confidence=85)),
+        ), patch(
+            "agents.orchestrator.grade_analysis", AsyncMock(side_effect=[AnalysisGrade(0.9, 0.99), ValueError("timeout")]),
+        ), patch("agents.orchestrator.pause_rollout", AsyncMock(return_value="demo")) as pause:
+            result = await LeadOrchestratorAgent().analyze_rollout(
+                "test-ns", "demo", "stable", "canary", pause_on_uncertainty=True, uncertainty_threshold=50,
+            )
+        self.assertTrue(result["promote"])
+        self.assertEqual(result["confidence"], 92)
+        self.assertEqual(result["effectiveConfidence"], 3)
+        self.assertEqual(result["pausedRollout"], "demo")
+        pause.assert_awaited_once_with("test-ns", "demo")
+
     @patch.dict(os.environ, {"GEMINI_API_KEY": "test"}, clear=True)
     async def test_http_pipeline_with_actual_google_request_adapters_and_failure_fixture(self):
         requests = []
@@ -494,7 +681,14 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.json()["promote"])
         self.assertEqual(response.json()["rootCause"], "NPE in ExampleResource")
-        self.assertEqual(len(requests), 2)
+        self.assertEqual(
+            requests,
+            [
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent",
+                "https://generativelanguage.googleapis.com/v1beta/decisions",
+            ],
+        )
+        self.assertIn("Decision 1 (enforce): support score=", response.json()["votingRationale"])
         self.assertEqual(delegate.call_args.args[0].issueCategory, "CODE_BUG")
 
     async def test_pause_only_uncertain_promote_and_response_confidence_unchanged(self):
@@ -543,6 +737,13 @@ class PauseAndContractTests(unittest.IsolatedAsyncioTestCase):
         api.get_namespaced_custom_object.side_effect = [{"spec": {"paused": False}}, {"spec": {"paused": False}}]
         with self.assertRaises(RuntimeError):
             _pause_rollout("ns", "demo")
+        api.patch_namespaced_custom_object.reset_mock()
+        api.get_namespaced_custom_object.side_effect = [{"spec": {"paused": False}}]
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaises(RuntimeError):
+            _pause_rollout("ns", "demo", cancelled=cancelled)
+        api.patch_namespaced_custom_object.assert_not_called()
 
     @patch("agents.log_proxy._ensure_config")
     @patch("agents.log_proxy.client.CoreV1Api")
@@ -554,13 +755,25 @@ class PauseAndContractTests(unittest.IsolatedAsyncioTestCase):
         )
         api = factory.return_value
         api.list_namespaced_pod.return_value.items = [terminating, active]
-        api.read_namespaced_pod_log.return_value = "healthy"
-        self.assertIn("POD new", get_first_pod_logs("ns", "role=stable"))
+        api.read_namespaced_pod_log.return_value = ("x" * 60_000) + "FINAL_STACK"
+        out = get_first_pod_logs("ns", "role=stable")
+        self.assertIn("POD new", out)
+        self.assertTrue(out.endswith("FINAL_STACK"))
+        self.assertNotIn("limit_bytes", api.read_namespaced_pod_log.call_args.kwargs)
+        self.assertLessEqual(len(out.split("\n", 1)[1]), 48_000)
         with self.assertRaises(ValueError):
             get_first_pod_logs("kube-system", "role=stable")
         api.list_namespaced_pod.return_value.items = [terminating]
         with self.assertRaises(ValueError):
             get_first_pod_logs("ns", "role=stable")
+
+    async def test_specialist_request_accepts_null_extra_prompt(self):
+        with patch("main.LogAnalystAgent.collect", AsyncMock(return_value=EvidenceReport(source="logs"))):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app("logs")), base_url="http://test") as http:
+                response = await http.post("/analyze/logs", json={
+                    "namespace": "ns", "stableSelector": "stable", "canarySelector": "canary", "extraPrompt": None,
+                })
+        self.assertEqual(response.status_code, 200)
 
     async def test_http_aliases_forward_pause_prompt_and_model_controls(self):
         with patch("main.LeadOrchestratorAgent") as factory:

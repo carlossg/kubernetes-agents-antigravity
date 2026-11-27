@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from kubernetes import client
 from kubernetes.config.config_exception import ConfigException
 from pydantic import BaseModel, ValidationError
+from urllib3.exceptions import HTTPError as KubernetesHTTPError
 
 from agents import activity, remediation
 from agents.contracts import AnalysisContext
@@ -29,7 +30,7 @@ class SpecialistRequest(BaseModel):
     namespace: str
     stableSelector: str
     canarySelector: str
-    extraPrompt: str = ""
+    extraPrompt: str | None = ""
 
 
 @asynccontextmanager
@@ -67,7 +68,7 @@ def create_app(role: str = "orchestrator") -> FastAPI:
                         uncertainty_threshold=ctx.uncertaintyThreshold, prompt=request.prompt,
                     )
             except (httpx.HTTPError, ValueError, RuntimeError, TimeoutError,
-                    client.ApiException, ConfigException, OSError) as exc:
+                    client.ApiException, ConfigException, KubernetesHTTPError, OSError) as exc:
                 activity.feed.emit(activity.ERROR, "Orchestrator error", str(exc))
                 raise HTTPException(status_code=500, detail="Analysis failed; see activity feed") from exc
 
@@ -86,7 +87,8 @@ def create_app(role: str = "orchestrator") -> FastAPI:
                     request.namespace, request.stableSelector, request.canarySelector,
                 )
                 return {"analysis": report.text(), "evidence": report.model_dump()}
-            except (httpx.HTTPError, ValueError, client.ApiException, ConfigException, OSError) as exc:
+            except (httpx.HTTPError, ValueError, client.ApiException, ConfigException,
+                    KubernetesHTTPError, OSError) as exc:
                 activity.feed.emit(activity.ERROR, f"{role} collection error", str(exc))
                 raise HTTPException(status_code=500, detail=f"{role} collection failed") from exc
 
@@ -99,7 +101,7 @@ def create_app(role: str = "orchestrator") -> FastAPI:
                 return {"logs": get_first_pod_logs(namespace, label_selector)}
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-            except (client.ApiException, ConfigException, OSError) as exc:
+            except (client.ApiException, ConfigException, KubernetesHTTPError, OSError) as exc:
                 activity.feed.emit(activity.ERROR, "Log proxy error", str(exc))
                 raise HTTPException(status_code=500, detail="Log proxy failed") from exc
     else:
