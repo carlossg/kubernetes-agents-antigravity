@@ -324,7 +324,7 @@ spec:
               value: enforce
             # A2A JSON-RPC endpoint; model and GitHub credentials live in that service.
             - name: REMEDIATION_AGENT_URL
-              value: "http://remediation-agent.remediation-system.svc.cluster.local:8080"
+              value: "http://kubernetes-agent-remediation.argo-rollouts.svc.cluster.local:8080"
             - name: GEMINI_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -338,3 +338,82 @@ spec:
               value: "http://kubernetes-agent-events.argo-rollouts.svc.cluster.local:8080"
           ports:
             - containerPort: 8080
+---
+# -----------------------------------------------------------------------------
+# Remediation Agent Service & Deployment (Antigravity SDK + A2A 1.0)
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubernetes-remediation-sa
+  namespace: argo-rollouts
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubernetes-agent-remediation
+  namespace: argo-rollouts
+spec:
+  ports:
+    - port: 8080
+      targetPort: 8080
+  selector:
+    app: kubernetes-agent-remediation
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubernetes-agent-remediation
+  namespace: argo-rollouts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubernetes-agent-remediation
+  template:
+    metadata:
+      labels:
+        app: kubernetes-agent-remediation
+    spec:
+      serviceAccountName: kubernetes-remediation-sa
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: agent
+          image: kubernetes-agents-antigravity:latest
+          imagePullPolicy: Always
+          args: ["--role", "remediation"]
+          env:
+            - name: HOME
+              value: /tmp
+            - name: GEMINI_MODEL
+              value: gemini-4-neon
+            - name: REMEDIATION_MODEL
+              value: gemini-4-neon
+            - name: REMEDIATION_ALLOWED_REPOS
+              value: "https://github.com/carlossg/argo-rollouts-aiops-dashboard,https://github.com/kdubois/argo-rollouts-quarkus-demo"
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: argo-rollouts-secret
+                  key: GEMINI_API_KEY
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: argo-rollouts-secret
+                  key: GITHUB_TOKEN
+          ports:
+            - containerPort: 8080
+          securityContext:
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
+            requests:
+              cpu: "250m"
+              memory: "512Mi"

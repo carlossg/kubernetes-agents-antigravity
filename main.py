@@ -104,6 +104,10 @@ def create_app(role: str = "orchestrator") -> FastAPI:
             except (client.ApiException, ConfigException, KubernetesHTTPError, OSError) as exc:
                 activity.feed.emit(activity.ERROR, "Log proxy error", str(exc))
                 raise HTTPException(status_code=500, detail="Log proxy failed") from exc
+    elif role == "remediation":
+        from agents.remediation_server import register_remediation_routes
+
+        register_remediation_routes(app)
     else:
         raise ValueError(f"Unknown role: {role}")
     return app
@@ -113,7 +117,7 @@ app = create_app()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Kubernetes AI/Ops Agent - Gemini")
-    parser.add_argument("--role", choices=["orchestrator", "logs", "metrics", "events", "log-proxy"],
+    parser.add_argument("--role", choices=["orchestrator", "logs", "metrics", "events", "log-proxy", "remediation"],
                         default="orchestrator")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
