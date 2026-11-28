@@ -387,14 +387,8 @@ spec:
         - protocol: TCP
           port: 8080
   egress:
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-          podSelector:
-            matchLabels:
-              k8s-app: kube-dns
-      ports:
+    # Allow DNS to kube-dns/CoreDNS and GKE NodeLocalDNS (e.g. 169.254.20.10:53)
+    - ports:
         - protocol: UDP
           port: 53
         - protocol: TCP
