@@ -1,0 +1,83 @@
+# Kubernetes infrastructure only. ActorTemplate/Actor are NOT Kubernetes CRDs.
+apiVersion: ate.dev/v1
+kind: WorkerPool
+metadata:
+  name: kubernetes-agent-logs
+  namespace: argo-rollouts
+  labels:
+    workload: kubernetes-agent-logs
+spec:
+  replicas: 1
+  workerImage: ghcr.io/agent-substrate/substrate/ateworker-gvisor:v1.0.0
+  sandboxClasses:
+    - name: gvisor
+      configRef:
+        name: gvisor-default
+  template:
+    resources:
+      limits: {cpu: "1", memory: 2Gi}
+      requests: {cpu: "250m", memory: 2Gi}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubernetes-agent-logs-bridge
+  namespace: argo-rollouts
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubernetes-agent-logs-substrate-bridge
+  namespace: argo-rollouts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubernetes-agent-logs
+  template:
+    metadata:
+      labels:
+        app: kubernetes-agent-logs
+    spec:
+      serviceAccountName: kubernetes-agent-logs-bridge
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: bridge
+          image: kubernetes-agents-antigravity:latest
+          command: ["python", "-m", "uvicorn", "agents.substrate_bridge:app", "--host", "0.0.0.0", "--port", "8080"]
+          ports:
+            - containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: router-client
+              mountPath: /var/run/substrate
+              readOnly: true
+          readinessProbe:
+            httpGet: {path: /, port: 8080}
+            timeoutSeconds: 100
+            periodSeconds: 120
+          resources:
+            limits: {cpu: "250m", memory: 256Mi}
+            requests: {cpu: "100m", memory: 128Mi}
+      volumes:
+        - name: router-client
+          projected:
+            sources:
+              - podCertificate:
+                  signerName: podidentity.podcert.ate.dev/identity
+                  keyType: ECDSAP256
+                  credentialBundlePath: credential-bundle.pem
+              - clusterTrustBundle:
+                  signerName: servicedns.podcert.ate.dev/identity
+                  labelSelector:
+                    matchLabels:
+                      podcert.ate.dev/canarying: live
+                  path: router-ca.pem

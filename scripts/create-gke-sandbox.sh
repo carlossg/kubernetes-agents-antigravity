@@ -8,6 +8,12 @@
 
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${ROOT}/scripts/sandbox-backend.sh"
+if [[ "${SANDBOX_BACKEND}" == substrate ]]; then
+    exec bash "${ROOT}/scripts/install-substrate.sh" "$@"
+fi
+
 # Configurable defaults (can be overridden by environment variables)
 CLUSTER_NAME="${CLUSTER_NAME:-autopilot-cluster-1}"
 LOCATION="${LOCATION:-us-central1}"

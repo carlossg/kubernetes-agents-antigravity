@@ -6,6 +6,29 @@
 
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${ROOT}/scripts/sandbox-backend.sh"
+cd "${ROOT}"
+if [[ "${1:-}" == "--backend-plan" ]]; then
+    if [[ "${SANDBOX_BACKEND}" == substrate ]]; then
+        exec bash scripts/install-substrate.sh --plan
+    fi
+    echo "gvisor: GKE Agent Sandbox addon, gvisor RuntimeClass, agents.x-k8s.io Sandbox CRD"
+    exit 0
+fi
+[[ $# == 0 ]] || { echo "Usage: $0 [--backend-plan]" >&2; exit 2; }
+if [[ "${SANDBOX_BACKEND}" == gvisor ]]; then
+    kubectl get runtimeclass gvisor >/dev/null
+    kubectl get crd sandboxes.agents.x-k8s.io >/dev/null
+    [[ -z "$(kubectl get deployment kubernetes-agent-logs-substrate-bridge -n argo-rollouts --ignore-not-found -o name)" ]] || {
+        echo "Remove the Substrate bridge and actor before switching to gvisor." >&2; exit 1;
+    }
+else
+    kubectl get crd workerpools.ate.dev >/dev/null || {
+        echo "Install Substrate first: SANDBOX_BACKEND=substrate bash scripts/create-gke-sandbox.sh" >&2; exit 1;
+    }
+fi
+
 # Auto-detect Colima docker socket if running on macOS
 if [ -S "${HOME}/.colima/default/docker.sock" ]; then
     export DOCKER_HOST="unix://${HOME}/.colima/default/docker.sock"
@@ -57,17 +80,27 @@ kubectl create secret generic argo-rollouts-secret \
 # 5. Deploy manifests using the GCR registry image
 echo "📄 Deploying agent workloads..."
 cat k8s/agents.yaml | sed "s|kubernetes-agents-antigravity:latest|${IMAGE_URL}|g" | kubectl apply -f -
-cat k8s/log-analyst-sandbox.yaml | sed "s|kubernetes-agents-antigravity:latest|${IMAGE_URL}|g" | kubectl apply -f -
+if [[ "${SANDBOX_BACKEND}" == substrate ]]; then
+    # Substrate validates immutable OCI digests, and gets the UID from image USER.
+    export ACTOR_IMAGE
+    ACTOR_IMAGE="$(docker image inspect "${IMAGE_URL}" --format '{{index .RepoDigests 0}}')"
+    bash scripts/deploy-substrate.sh
+else
+    sed "s|kubernetes-agents-antigravity:latest|${IMAGE_URL}|g" k8s/log-analyst-sandbox.yaml | kubectl apply -f -
+fi
 
 # 6. Wait for deployments
 echo "⏳ Waiting for specialist deployments to be ready..."
 kubectl rollout status deployment/kubernetes-agent-orchestrator -n argo-rollouts --timeout=3m
 kubectl rollout status deployment/kubernetes-agent-metrics -n argo-rollouts --timeout=3m
 kubectl rollout status deployment/kubernetes-agent-events -n argo-rollouts --timeout=3m
+kubectl rollout status deployment/kubernetes-agent-log-proxy -n argo-rollouts --timeout=3m
 
 echo "⏳ Waiting for log analyst sandbox to be ready..."
-# Give GKE a moment to schedule sandbox pods
-sleep 15
+if [[ "${SANDBOX_BACKEND}" == gvisor ]]; then
+    # Preserve the addon controller's existing pod-creation grace period.
+    sleep 15
+fi
 kubectl wait --for=condition=Ready pod -l app=kubernetes-agent-logs -n argo-rollouts --timeout=5m
 
 # 7. Run Test Analysis Execution

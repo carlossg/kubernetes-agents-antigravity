@@ -18,6 +18,9 @@ COPY agents/ agents/
 # Expose port
 EXPOSE 8080
 
+# Substrate takes the process identity from OCI image metadata.
+USER 1000:1000
+
 # Run FastAPI app
 ENTRYPOINT ["python", "main.py"]
 
