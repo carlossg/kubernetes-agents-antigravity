@@ -36,10 +36,12 @@ class SpecialistRequest(BaseModel):
 @asynccontextmanager
 async def lifespan(app):
     yield
-    await remediation.shutdown()
-    store = getattr(app.state, "remediation_task_store", None)
-    if store is not None:
-        await store.shutdown()
+    try:
+        await remediation.shutdown()
+    finally:
+        store = getattr(app.state, "remediation_task_store", None)
+        if store is not None:
+            await store.shutdown()
 
 
 def create_app(role: str = "orchestrator") -> FastAPI:

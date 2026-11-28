@@ -60,8 +60,10 @@ class RepoHelpersTests(unittest.TestCase):
         self.assertFalse(is_repo_allowed("https://github.com/any/repo", []))
 
     def test_extract_json_handles_fences_and_surrounding_braces(self):
-        raw = 'Note {ignore me} here:\n```json\n{"path": "src/App.java", "newContent": "class App {}"}\n```\nTrailing {braces}'
+        raw = 'Note {"status": 500} and {} here:\n```json\n{"path": "src/App.java", "newContent": "class App {}"}\n```\nTrailing {braces}'
         self.assertEqual(extract_json(raw), {"path": "src/App.java", "newContent": "class App {}"})
+        raw_unfenced = 'MetricsResource {} threw NPE; fix: {"path": "src/Metrics.java", "newContent": "ok"}'
+        self.assertEqual(extract_json(raw_unfenced), {"path": "src/Metrics.java", "newContent": "ok"})
         with self.assertRaises(ValueError):
             extract_json("no json here")
 
@@ -312,6 +314,14 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
 
         fake_agent.propose_fix = AsyncMock(return_value={"path": "src/App.java", "newContent": "x"})
         fake_gh.create_pull_request = AsyncMock(side_effect=RuntimeError("409 conflict"))
+        fake_gh.create_issue = AsyncMock(return_value="https://github.com/o/r/issues/12")
+        resp_pr_issue = await svc.remediate(_sample_request("CODE_BUG"))
+        self.assertEqual(resp_pr_issue.status, "pr_failed")
+        self.assertEqual(resp_pr_issue.issueLink, "https://github.com/o/r/issues/12")
+        issue_body = fake_gh.create_issue.call_args.args[1]
+        self.assertNotIn("409 conflict", issue_body)
+        self.assertIn("RuntimeError", issue_body)
+
         fake_gh.create_issue = AsyncMock(side_effect=RuntimeError("issue failed"))
         resp2 = await svc.remediate(_sample_request("CODE_BUG"))
         self.assertEqual(resp2.status, "pr_failed")
@@ -396,6 +406,7 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
                 for body, expected_code in (
                     ("{not-json", -32700),
                     (json.dumps({"jsonrpc": "2.0", "id": "2"}), -32600),
+                    (json.dumps({"jsonrpc": "2.0", "id": True, "method": "GetTask", "params": {}}), -32600),
                     (json.dumps({"jsonrpc": "2.0", "id": "3", "method": "Unknown", "params": {}}), -32601),
                     (json.dumps({"jsonrpc": "2.0", "id": "4", "method": "GetTask", "params": []}), -32602),
                     (json.dumps({"jsonrpc": "2.0", "id": "5", "method": "SendMessage", "params": {"message": {"parts": []}}}), -32602),
@@ -403,6 +414,9 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
                 ):
                     resp = await client.post("/", headers=auth_headers, content=body)
                     self.assertEqual(resp.json()["error"]["code"], expected_code)
+
+                oversized = await client.post("/", headers=auth_headers, content="x" * 1_100_000)
+                self.assertEqual(oversized.status_code, 413)
 
                 real_sleep = asyncio.sleep
 
@@ -414,6 +428,34 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.status, "success")
             self.assertEqual(result.prLink, "https://github.com/o/r/pull/99")
             self.assertEqual(result.message, "Added null guard")
+        finally:
+            await store.shutdown()
+
+    @patch.dict(os.environ, {"REMEDIATION_AGENT_TOKEN": "secret-token"}, clear=True)
+    async def test_a2a_server_capacity_and_task_failure(self):
+        failing_svc = MagicMock()
+        failing_svc.remediate = AsyncMock(side_effect=RuntimeError("boom"))
+        test_app = FastAPI()
+        store = register_remediation_routes(test_app, service=failing_svc, task_store=A2ATaskStore(max_active=1))
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=test_app), base_url="http://remediation",
+            ) as client:
+                headers = {"Authorization": "Bearer secret-token"}
+                send_body = {
+                    "jsonrpc": "2.0", "id": "1", "method": "SendMessage",
+                    "params": {"message": {"parts": [{"text": _sample_request().model_dump_json()}]}},
+                }
+                r1 = await client.post("/", headers=headers, json=send_body)
+                task_id = r1.json()["result"]["task"]["id"]
+                r2 = await client.post("/", headers=headers, json=send_body)
+                self.assertEqual(r2.json()["error"]["code"], -32000)
+
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                t = (await client.post("/", headers=headers, json={"jsonrpc": "2.0", "id": "2", "method": "GetTask", "params": {"id": task_id}})).json()["result"]
+                self.assertEqual(t["status"]["state"], "TASK_STATE_FAILED")
+                self.assertEqual(t["status"]["message"]["parts"][0]["text"], "boom")
         finally:
             await store.shutdown()
 
