@@ -66,8 +66,8 @@ class RepoHelpersTests(unittest.TestCase):
             extract_json("no json here")
 
 
-class GitHubRepoTests(unittest.TestCase):
-    def test_find_read_and_create_pr_with_slash_branch(self):
+class GitHubRepoTests(unittest.IsolatedAsyncioTestCase):
+    async def test_find_read_and_create_pr_with_slash_branch(self):
         def handler(request: httpx.Request) -> httpx.Response:
             if request.method == "GET" and request.url.path.endswith("/git/ref/heads/release/1.0"):
                 return httpx.Response(200, json={"ref": "refs/heads/release/1.0", "object": {"sha": "base-sha"}})
@@ -78,7 +78,9 @@ class GitHubRepoTests(unittest.TestCase):
                 ]})
             if request.method == "GET" and "/contents/" in request.url.path:
                 encoded = base64.b64encode(b"class MetricsResource {}").decode("ascii")
-                return httpx.Response(200, json={"type": "file", "content": encoded, "sha": "blob-sha"})
+                return httpx.Response(200, json={
+                    "type": "file", "encoding": "base64", "size": 24, "content": encoded, "sha": "blob-sha",
+                })
             if request.method == "POST" and request.url.path.endswith("/git/refs"):
                 return httpx.Response(201, json={"ref": "refs/heads/fix/1"})
             if request.method == "PUT" and "/contents/" in request.url.path:
@@ -89,11 +91,11 @@ class GitHubRepoTests(unittest.TestCase):
                 return httpx.Response(201, json={"html_url": "https://github.com/o/r/issues/9"})
             raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
-        with httpx.Client(base_url="https://api.github.com", transport=httpx.MockTransport(handler)) as client:
+        async with httpx.AsyncClient(base_url="https://api.github.com", transport=httpx.MockTransport(handler)) as client:
             gh = GitHubRepo("https://github.com/o/r", "tok", base_branch="release/1.0", client=client)
-            self.assertEqual(gh.find_files("Metrics"), ["src/main/java/MetricsResource.java"])
-            self.assertEqual(gh.read_file("src/main/java/MetricsResource.java"), "class MetricsResource {}")
-            pr_url = gh.create_pull_request(
+            self.assertEqual(await gh.find_files("Metrics"), ["src/main/java/MetricsResource.java"])
+            self.assertEqual(await gh.read_file("src/main/java/MetricsResource.java"), "class MetricsResource {}")
+            pr_url = await gh.create_pull_request(
                 "src/main/java/MetricsResource.java",
                 "class MetricsResource { /* fixed */ }",
                 "Fix: NPE",
@@ -101,18 +103,27 @@ class GitHubRepoTests(unittest.TestCase):
                 "fix/1",
             )
             self.assertEqual(pr_url, "https://github.com/o/r/pull/42")
-            issue_url = gh.create_issue("Issue", "body")
+            issue_url = await gh.create_issue("Issue", "body")
             self.assertEqual(issue_url, "https://github.com/o/r/issues/9")
 
-    def test_security_guards_noop_and_orphaned_branch_cleanup(self):
+    async def test_security_guards_encoding_none_sha_mismatch_and_cleanup(self):
         deleted_refs = []
+        current_sha = "blob-sha"
 
         def handler(request: httpx.Request) -> httpx.Response:
             if request.method == "GET" and request.url.path.endswith("/git/ref/heads/main"):
                 return httpx.Response(200, json={"ref": "refs/heads/main", "object": {"sha": "base-sha"}})
+            if request.method == "GET" and request.url.path.endswith("/git/ref/heads/main-prefix"):
+                return httpx.Response(200, json=[{"ref": "refs/heads/main-prefix-1"}])
+            if request.method == "GET" and request.url.path.endswith("/contents/huge.bin"):
+                return httpx.Response(200, json={
+                    "type": "file", "encoding": "none", "size": 2_000_000, "content": "", "sha": "huge-sha",
+                })
             if request.method == "GET" and "/contents/" in request.url.path:
                 encoded = base64.b64encode(b"class A {}").decode("ascii")
-                return httpx.Response(200, json={"type": "file", "content": encoded, "sha": "blob-sha"})
+                return httpx.Response(200, json={
+                    "type": "file", "encoding": "base64", "size": 10, "content": encoded, "sha": current_sha,
+                })
             if request.method == "POST" and request.url.path.endswith("/git/refs"):
                 return httpx.Response(201, json={"ref": "refs/heads/fix/1"})
             if request.method == "PUT" and "/contents/" in request.url.path:
@@ -122,20 +133,31 @@ class GitHubRepoTests(unittest.TestCase):
                 return httpx.Response(204)
             raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
-        with httpx.Client(base_url="https://api.github.com", transport=httpx.MockTransport(handler)) as client:
+        async with httpx.AsyncClient(base_url="https://api.github.com", transport=httpx.MockTransport(handler)) as client:
             gh = GitHubRepo("https://github.com/o/r", "tok", client=client)
             with self.assertRaises(ValueError):
-                gh.read_file("../../../other/secret")
+                await gh.read_file("../../../other/secret")
             with self.assertRaises(ValueError):
-                gh.create_pull_request(".GITHUB/workflows/ci.yml", "x", "t", "b", "fix/1")
+                await gh.read_file("huge.bin")
             with self.assertRaises(ValueError):
-                gh.create_pull_request("src/Unread.java", "x", "t", "b", "fix/1")
+                await gh._get_branch_sha("main-prefix")
+            for blocked in (".GITHUB/workflows/ci.yml", ".gitmodules", "src/Unread.java"):
+                with self.assertRaises(ValueError):
+                    await gh.create_pull_request(blocked, "x", "t", "b", "fix/1")
 
-            self.assertEqual(gh.read_file("src/A.java"), "class A {}")
+            self.assertEqual(await gh.read_file("src/A.java"), "class A {}")
             with self.assertRaises(ValueError):
-                gh.create_pull_request("src/A.java", "class A {}", "t", "b", "fix/1")
+                await gh.create_pull_request("src/A.java", "x" * (MAX_FILE_CHARS + 1), "t", "b", "fix/1")
+            with self.assertRaises(ValueError):
+                await gh.create_pull_request("src/A.java", "class A {}", "t", "b", "fix/1")
+
+            current_sha = "changed-sha"
             with self.assertRaises(RuntimeError):
-                gh.create_pull_request("src/A.java", "class A { /* fixed */ }", "t", "b", "fix/1")
+                await gh.create_pull_request("src/A.java", "class A { /* fixed */ }", "t", "b", "fix/1")
+
+            current_sha = "blob-sha"
+            with self.assertRaises(RuntimeError):
+                await gh.create_pull_request("src/A.java", "class A { /* fixed */ }", "t", "b", "fix/1")
             self.assertEqual(len(deleted_refs), 1)
 
 
@@ -195,8 +217,8 @@ class AntigravityAgentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tools_handle_errors_and_oversized_files(self):
         fake_gh = MagicMock(spec=GitHubRepo)
-        fake_gh.find_files.return_value = ["src/App.java"]
-        fake_gh.read_file.side_effect = ValueError(f"File 'big.java' exceeds {MAX_FILE_CHARS} characters")
+        fake_gh.find_files = AsyncMock(return_value=["src/App.java"])
+        fake_gh.read_file = AsyncMock(side_effect=ValueError(f"File 'big.java' exceeds {MAX_FILE_CHARS} characters"))
         find_tool, read_tool = _make_tools(fake_gh)
         self.assertEqual(await find_tool("App"), "src/App.java")
         self.assertIn("exceeds", await read_tool("big.java"))
@@ -215,6 +237,22 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
         resp = await svc.remediate(_sample_request(repo_url="https://github.com/o/r"))
         self.assertEqual(resp.status, "rejected")
 
+    @patch.dict(os.environ, {"REMEDIATION_ALLOWED_REPOS": "https://github.com/o/r"}, clear=True)
+    async def test_missing_tokens_return_infra_error(self):
+        svc = RemediationService()
+        resp = await svc.remediate(_sample_request("CODE_BUG"))
+        self.assertEqual(resp.status, "infra_error")
+        self.assertIn("GITHUB_TOKEN", resp.message)
+
+        fake_gh = MagicMock()
+        fake_gh.aclose = AsyncMock()
+        with patch.dict(os.environ, {"REMEDIATION_ALLOWED_REPOS": "https://github.com/o/r", "GITHUB_TOKEN": "tok"}, clear=True):
+            svc2 = RemediationService(repo_factory=lambda *_: fake_gh)
+            resp2 = await svc2.remediate(_sample_request("CODE_BUG"))
+        self.assertEqual(resp2.status, "infra_error")
+        self.assertIn("GEMINI_API_KEY", resp2.message)
+        fake_gh.aclose.assert_awaited_once()
+
     @patch.dict(os.environ, {
         "REMEDIATION_ALLOWED_REPOS": "https://github.com/o/r",
         "GITHUB_TOKEN": "tok",
@@ -222,7 +260,8 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
     }, clear=True)
     async def test_code_bug_opens_pr_and_closes_repo(self):
         fake_gh = MagicMock()
-        fake_gh.create_pull_request.return_value = "https://github.com/o/r/pull/10"
+        fake_gh.create_pull_request = AsyncMock(return_value="https://github.com/o/r/pull/10")
+        fake_gh.aclose = AsyncMock()
         fake_agent = MagicMock()
         fake_agent.api_key = "key"
         fake_agent.propose_fix = AsyncMock(return_value={
@@ -236,7 +275,7 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status, "success")
         self.assertEqual(resp.prLink, "https://github.com/o/r/pull/10")
         self.assertEqual(resp.message, "Added null guard")
-        fake_gh.close.assert_called_once()
+        fake_gh.aclose.assert_awaited_once()
 
     @patch.dict(os.environ, {
         "REMEDIATION_ALLOWED_REPOS": "https://github.com/o/r",
@@ -244,7 +283,8 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
     }, clear=True)
     async def test_operational_opens_issue_without_llm(self):
         fake_gh = MagicMock()
-        fake_gh.create_issue.return_value = "https://github.com/o/r/issues/5"
+        fake_gh.create_issue = AsyncMock(return_value="https://github.com/o/r/issues/5")
+        fake_gh.aclose = AsyncMock()
         fake_agent = MagicMock()
         fake_agent.propose_fix = AsyncMock()
         svc = RemediationService(agent=fake_agent, repo_factory=lambda *_: fake_gh)
@@ -258,9 +298,10 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
         "GITHUB_TOKEN": "tok",
         "GEMINI_API_KEY": "key",
     }, clear=True)
-    async def test_null_path_falls_back_to_issue_and_pr_failure_returns_pr_failed(self):
+    async def test_null_path_pr_failure_and_agent_error(self):
         fake_gh = MagicMock()
-        fake_gh.create_issue.return_value = "https://github.com/o/r/issues/11"
+        fake_gh.create_issue = AsyncMock(return_value="https://github.com/o/r/issues/11")
+        fake_gh.aclose = AsyncMock()
         fake_agent = MagicMock()
         fake_agent.api_key = "key"
         fake_agent.propose_fix = AsyncMock(return_value={"path": None})
@@ -270,12 +311,17 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.issueLink, "https://github.com/o/r/issues/11")
 
         fake_agent.propose_fix = AsyncMock(return_value={"path": "src/App.java", "newContent": "x"})
-        fake_gh.create_pull_request.side_effect = RuntimeError("409 conflict")
+        fake_gh.create_pull_request = AsyncMock(side_effect=RuntimeError("409 conflict"))
+        fake_gh.create_issue = AsyncMock(side_effect=RuntimeError("issue failed"))
         resp2 = await svc.remediate(_sample_request("CODE_BUG"))
         self.assertEqual(resp2.status, "pr_failed")
-        self.assertEqual(resp2.issueLink, "https://github.com/o/r/issues/11")
+        self.assertIsNone(resp2.issueLink)
 
-    async def test_task_store_preserves_active_tasks_and_does_not_reinsert_evicted(self):
+        fake_agent.propose_fix = AsyncMock(side_effect=TimeoutError("timed out"))
+        resp3 = await svc.remediate(_sample_request("CODE_BUG"))
+        self.assertEqual(resp3.status, "agent_error")
+
+    async def test_task_store_eviction_and_shutdown(self):
         store = A2ATaskStore(max_tasks=1, max_active=1)
         t1 = store.create()
         self.assertIsNotNone(t1)
@@ -286,15 +332,30 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
         store.fail(t1, "late")
         self.assertIsNone(store.get(t1))
 
+        cancelled = asyncio.Event()
+
+        async def sleeper():
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        store.track(asyncio.create_task(sleeper()))
+        await asyncio.sleep(0)
+        await store.shutdown()
+        self.assertTrue(cancelled.is_set())
+
     @patch.dict(os.environ, {
         "REMEDIATION_ALLOWED_REPOS": "https://github.com/o/r",
         "REMEDIATION_AGENT_TOKEN": "secret-token",
         "GITHUB_TOKEN": "tok",
         "GEMINI_API_KEY": "key",
     }, clear=True)
-    async def test_a2a_server_auth_errors_and_end_to_end_with_client(self):
+    async def test_a2a_server_auth_errors_capacity_and_end_to_end(self):
         fake_gh = MagicMock()
-        fake_gh.create_pull_request.return_value = "https://github.com/o/r/pull/99"
+        fake_gh.create_pull_request = AsyncMock(return_value="https://github.com/o/r/pull/99")
+        fake_gh.aclose = AsyncMock()
         fake_agent = MagicMock()
         fake_agent.api_key = "key"
         fake_agent.propose_fix = AsyncMock(return_value={
@@ -317,11 +378,19 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
                 card_json = card.json()
                 self.assertEqual(card_json["skills"][0]["id"], "remediate")
                 self.assertTrue(card_json["supportedInterfaces"][0]["url"].startswith("http://remediation"))
-                self.assertIn("bearerAuth", card_json["securitySchemes"])
+                self.assertIn("httpAuthSecurityScheme", card_json["securitySchemes"]["bearerAuth"])
+                self.assertEqual(card_json["securityRequirements"], [{"schemes": {"bearerAuth": {"list": []}}}])
 
                 unauth = await client.post("/", json={"jsonrpc": "2.0", "id": "1", "method": "GetTask", "params": {"id": "x"}})
                 self.assertEqual(unauth.status_code, 401)
                 self.assertEqual(unauth.headers.get("www-authenticate"), "Bearer")
+
+                with patch.dict(os.environ, {"REMEDIATION_AGENT_TOKEN": ""}):
+                    unconfigured = await client.post(
+                        "/", headers={"Authorization": "Bearer secret-token"},
+                        json={"jsonrpc": "2.0", "id": "1", "method": "GetTask", "params": {"id": "x"}},
+                    )
+                    self.assertEqual(unconfigured.status_code, 401)
 
                 auth_headers = {"Authorization": "Bearer secret-token"}
                 for body, expected_code in (
@@ -329,7 +398,8 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
                     (json.dumps({"jsonrpc": "2.0", "id": "2"}), -32600),
                     (json.dumps({"jsonrpc": "2.0", "id": "3", "method": "Unknown", "params": {}}), -32601),
                     (json.dumps({"jsonrpc": "2.0", "id": "4", "method": "GetTask", "params": []}), -32602),
-                    (json.dumps({"jsonrpc": "2.0", "id": "5", "method": "GetTask", "params": {"id": "missing"}}), -32001),
+                    (json.dumps({"jsonrpc": "2.0", "id": "5", "method": "SendMessage", "params": {"message": {"parts": []}}}), -32602),
+                    (json.dumps({"jsonrpc": "2.0", "id": "6", "method": "GetTask", "params": {"id": "missing"}}), -32001),
                 ):
                     resp = await client.post("/", headers=auth_headers, content=body)
                     self.assertEqual(resp.json()["error"]["code"], expected_code)

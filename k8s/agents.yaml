@@ -369,7 +369,7 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: kubernetes-agent-remediation-ingress
+  name: kubernetes-agent-remediation
   namespace: argo-rollouts
 spec:
   podSelector:
@@ -388,7 +388,9 @@ spec:
           port: 8080
   egress:
     - to:
-        - namespaceSelector: {}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
           podSelector:
             matchLabels:
               k8s-app: kube-dns
@@ -416,6 +418,8 @@ metadata:
   namespace: argo-rollouts
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: kubernetes-agent-remediation
@@ -451,6 +455,8 @@ spec:
               value: gemini-4-neon
             - name: REMEDIATION_ALLOWED_REPOS
               value: "https://github.com/carlossg/argo-rollouts-aiops-dashboard,https://github.com/kdubois/argo-rollouts-quarkus-demo"
+            - name: REMEDIATION_PUBLIC_URL
+              value: "http://kubernetes-agent-remediation.argo-rollouts.svc.cluster.local:8080/"
             - name: REMEDIATION_AGENT_TOKEN
               valueFrom:
                 secretKeyRef:
