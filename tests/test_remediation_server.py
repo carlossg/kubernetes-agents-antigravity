@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 from fastapi import FastAPI
 
-from agents.contracts import RemediationRequest
+from agents.contracts import RemediationRequest, RemediationResponse
 from agents.remediation import call_remediation
 from agents.remediation_server import (
     A2ATaskStore,
@@ -67,9 +67,11 @@ class RepoHelpersTests(unittest.TestCase):
 
 
 class GitHubRepoTests(unittest.TestCase):
-    def test_find_read_and_create_pr(self):
+    def test_find_read_and_create_pr_with_slash_branch(self):
         def handler(request: httpx.Request) -> httpx.Response:
-            if request.method == "GET" and request.url.path.endswith("/git/trees/main"):
+            if request.method == "GET" and request.url.path.endswith("/git/ref/heads/release/1.0"):
+                return httpx.Response(200, json={"ref": "refs/heads/release/1.0", "object": {"sha": "base-sha"}})
+            if request.method == "GET" and request.url.path.endswith("/git/trees/base-sha"):
                 return httpx.Response(200, json={"tree": [
                     {"path": "src/main/java/MetricsResource.java", "type": "blob"},
                     {"path": "README.md", "type": "blob"},
@@ -77,8 +79,6 @@ class GitHubRepoTests(unittest.TestCase):
             if request.method == "GET" and "/contents/" in request.url.path:
                 encoded = base64.b64encode(b"class MetricsResource {}").decode("ascii")
                 return httpx.Response(200, json={"type": "file", "content": encoded, "sha": "blob-sha"})
-            if request.method == "GET" and request.url.path.endswith("/git/ref/heads/main"):
-                return httpx.Response(200, json={"object": {"sha": "base-sha"}})
             if request.method == "POST" and request.url.path.endswith("/git/refs"):
                 return httpx.Response(201, json={"ref": "refs/heads/fix/1"})
             if request.method == "PUT" and "/contents/" in request.url.path:
@@ -90,7 +90,7 @@ class GitHubRepoTests(unittest.TestCase):
             raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
         with httpx.Client(base_url="https://api.github.com", transport=httpx.MockTransport(handler)) as client:
-            gh = GitHubRepo("https://github.com/o/r", "tok", client=client)
+            gh = GitHubRepo("https://github.com/o/r", "tok", base_branch="release/1.0", client=client)
             self.assertEqual(gh.find_files("Metrics"), ["src/main/java/MetricsResource.java"])
             self.assertEqual(gh.read_file("src/main/java/MetricsResource.java"), "class MetricsResource {}")
             pr_url = gh.create_pull_request(
@@ -104,13 +104,22 @@ class GitHubRepoTests(unittest.TestCase):
             issue_url = gh.create_issue("Issue", "body")
             self.assertEqual(issue_url, "https://github.com/o/r/issues/9")
 
-    def test_path_traversal_blocked_and_stale_sha_rejected(self):
+    def test_security_guards_noop_and_orphaned_branch_cleanup(self):
+        deleted_refs = []
+
         def handler(request: httpx.Request) -> httpx.Response:
             if request.method == "GET" and request.url.path.endswith("/git/ref/heads/main"):
-                return httpx.Response(200, json={"object": {"sha": "base-sha"}})
+                return httpx.Response(200, json={"ref": "refs/heads/main", "object": {"sha": "base-sha"}})
             if request.method == "GET" and "/contents/" in request.url.path:
                 encoded = base64.b64encode(b"class A {}").decode("ascii")
-                return httpx.Response(200, json={"type": "file", "content": encoded, "sha": "new-sha"})
+                return httpx.Response(200, json={"type": "file", "content": encoded, "sha": "blob-sha"})
+            if request.method == "POST" and request.url.path.endswith("/git/refs"):
+                return httpx.Response(201, json={"ref": "refs/heads/fix/1"})
+            if request.method == "PUT" and "/contents/" in request.url.path:
+                return httpx.Response(409, text="conflict")
+            if request.method == "DELETE" and "/git/refs/heads/" in request.url.path:
+                deleted_refs.append(request.url.path)
+                return httpx.Response(204)
             raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
         with httpx.Client(base_url="https://api.github.com", transport=httpx.MockTransport(handler)) as client:
@@ -118,10 +127,16 @@ class GitHubRepoTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 gh.read_file("../../../other/secret")
             with self.assertRaises(ValueError):
-                gh.create_pull_request(".github/workflows/ci.yml", "x", "t", "b", "fix/1")
-            gh._read_blobs["src/A.java"] = "old-sha"
+                gh.create_pull_request(".GITHUB/workflows/ci.yml", "x", "t", "b", "fix/1")
+            with self.assertRaises(ValueError):
+                gh.create_pull_request("src/Unread.java", "x", "t", "b", "fix/1")
+
+            self.assertEqual(gh.read_file("src/A.java"), "class A {}")
+            with self.assertRaises(ValueError):
+                gh.create_pull_request("src/A.java", "class A {}", "t", "b", "fix/1")
             with self.assertRaises(RuntimeError):
-                gh.create_pull_request("src/A.java", "class A { /* x */ }", "t", "b", "fix/1")
+                gh.create_pull_request("src/A.java", "class A { /* fixed */ }", "t", "b", "fix/1")
+            self.assertEqual(len(deleted_refs), 1)
 
 
 class AntigravityAgentTests(unittest.IsolatedAsyncioTestCase):
@@ -158,6 +173,25 @@ class AntigravityAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cfg.model, "gemini-4-neon")
         self.assertEqual(cfg.workspaces, [])
         self.assertEqual([t.__name__ for t in cfg.tools], ["find_repo_files", "read_repo_file"])
+        self.assertFalse(os.path.exists(cfg.app_data_dir))
+
+    async def test_propose_fix_timeout_raises_timeout_error(self):
+        fake_agent = MagicMock()
+
+        async def slow_chat(_):
+            await asyncio.sleep(5)
+
+        fake_agent.chat = slow_chat
+        fake_cm = MagicMock()
+        fake_cm.__aenter__ = AsyncMock(return_value=fake_agent)
+        fake_cm.__aexit__ = AsyncMock(return_value=False)
+        fake_gh = MagicMock(spec=GitHubRepo)
+        with patch.dict(os.environ, {"REMEDIATION_AGENT_TIMEOUT_SECONDS": "0.01"}, clear=True), patch(
+            "agents.remediation_server.Agent", return_value=fake_cm,
+        ):
+            agent = AntigravityRemediationAgent(model="gemini-4-neon", api_key="test-key")
+            with self.assertRaises(TimeoutError):
+                await agent.propose_fix(fake_gh, _sample_request())
 
     async def test_tools_handle_errors_and_oversized_files(self):
         fake_gh = MagicMock(spec=GitHubRepo)
@@ -242,11 +276,11 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp2.issueLink, "https://github.com/o/r/issues/11")
 
     async def test_task_store_preserves_active_tasks_and_does_not_reinsert_evicted(self):
-        store = A2ATaskStore(max_tasks=1)
+        store = A2ATaskStore(max_tasks=1, max_active=1)
         t1 = store.create()
         self.assertIsNotNone(t1)
         self.assertIsNone(store.create())
-        store.complete(t1, RemediationService and RemediationRequest and __import__("agents.contracts", fromlist=["RemediationResponse"]).RemediationResponse(status="issue", issueLink="https://github.com/o/r/issues/1"))
+        store.complete(t1, RemediationResponse(status="issue", issueLink="https://github.com/o/r/issues/1"))
         t2 = store.create()
         self.assertIsNotNone(t2)
         store.fail(t1, "late")
@@ -280,17 +314,25 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
             ) as client:
                 card = await client.get("/.well-known/agent-card.json")
                 self.assertEqual(card.status_code, 200)
-                self.assertEqual(card.json()["skills"][0]["id"], "remediate")
+                card_json = card.json()
+                self.assertEqual(card_json["skills"][0]["id"], "remediate")
+                self.assertTrue(card_json["supportedInterfaces"][0]["url"].startswith("http://remediation"))
+                self.assertIn("bearerAuth", card_json["securitySchemes"])
 
                 unauth = await client.post("/", json={"jsonrpc": "2.0", "id": "1", "method": "GetTask", "params": {"id": "x"}})
                 self.assertEqual(unauth.status_code, 401)
+                self.assertEqual(unauth.headers.get("www-authenticate"), "Bearer")
 
-                bad_method = await client.post(
-                    "/",
-                    headers={"Authorization": "Bearer secret-token"},
-                    json={"jsonrpc": "2.0", "id": "2", "method": "Unknown", "params": {}},
-                )
-                self.assertEqual(bad_method.json()["error"]["code"], -32601)
+                auth_headers = {"Authorization": "Bearer secret-token"}
+                for body, expected_code in (
+                    ("{not-json", -32700),
+                    (json.dumps({"jsonrpc": "2.0", "id": "2"}), -32600),
+                    (json.dumps({"jsonrpc": "2.0", "id": "3", "method": "Unknown", "params": {}}), -32601),
+                    (json.dumps({"jsonrpc": "2.0", "id": "4", "method": "GetTask", "params": []}), -32602),
+                    (json.dumps({"jsonrpc": "2.0", "id": "5", "method": "GetTask", "params": {"id": "missing"}}), -32001),
+                ):
+                    resp = await client.post("/", headers=auth_headers, content=body)
+                    self.assertEqual(resp.json()["error"]["code"], expected_code)
 
                 real_sleep = asyncio.sleep
 

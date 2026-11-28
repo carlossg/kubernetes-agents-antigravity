@@ -1,7 +1,6 @@
 """Antigravity SDK remediation agent and A2A 1.0 JSON-RPC server."""
 import asyncio
 import base64
-import contextlib
 import hmac
 import json
 import logging
@@ -29,12 +28,13 @@ MAX_FILE_CHARS = 60_000
 MAX_DIAGNOSTIC_CHARS = 8_000
 MAX_LISTED_FILES = 40
 MAX_STORED_TASKS = 200
+MAX_ACTIVE_TASKS = 8
 MAX_CONCURRENT_TASKS = 4
 DEFAULT_AGENT_TIMEOUT_SECONDS = 300.0
 _GITHUB_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 _TERMINAL_STATES = {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED"}
-_BLOCKED_PATH_PREFIXES = (".github/",)
+_BLOCKED_PATH_PREFIXES = (".github/", ".git/")
 
 
 def parse_repo_url(repo_url: str) -> tuple[str, str]:
@@ -84,7 +84,7 @@ def _validate_repo_path(path: str) -> str:
     if any(seg in {"", ".", ".."} for seg in segments):
         raise ValueError(f"Path traversal or empty segment in repository path: {path!r}")
     normalized = "/".join(segments)
-    if any(normalized.startswith(prefix) for prefix in _BLOCKED_PATH_PREFIXES):
+    if any(normalized.lower().startswith(prefix) for prefix in _BLOCKED_PATH_PREFIXES):
         raise ValueError(f"Modifications under {normalized} are not permitted")
     return normalized
 
@@ -100,12 +100,17 @@ def _validate_branch(branch: str) -> str:
         or not branch
         or branch.startswith("/")
         or branch.endswith("/")
+        or branch.startswith("-")
+        or branch.endswith(".lock")
         or ".." in branch
         or "//" in branch
         or not _BRANCH_RE.fullmatch(branch)
     ):
         raise ValueError(f"Invalid branch name: {branch!r}")
-    return "/".join(quote(seg, safe="") for seg in branch.split("/"))
+    segments = branch.split("/")
+    if any(seg in {"", ".", ".."} for seg in segments):
+        raise ValueError(f"Invalid branch segment: {branch!r}")
+    return "/".join(quote(seg, safe="") for seg in segments)
 
 
 def extract_json(text: str) -> dict[str, Any]:
@@ -165,10 +170,17 @@ class GitHubRepo:
             return {}
         return resp.json()
 
+    def _get_branch_sha(self, branch: str) -> str:
+        encoded_branch = _validate_branch(branch)
+        ref_data = self._request("GET", f"/git/ref/heads/{encoded_branch}")
+        if not isinstance(ref_data, dict) or ref_data.get("ref") != f"refs/heads/{branch}":
+            raise ValueError(f"Branch '{branch}' not found")
+        return ref_data["object"]["sha"]
+
     def list_paths(self) -> list[str]:
         if self._paths is None:
-            encoded_branch = _validate_branch(self.base_branch)
-            tree = self._request("GET", f"/git/trees/{encoded_branch}", params={"recursive": "1"})
+            base_sha = self._get_branch_sha(self.base_branch)
+            tree = self._request("GET", f"/git/trees/{quote(base_sha, safe='')}", params={"recursive": "1"})
             if tree.get("truncated"):
                 logger.warning("GitHub tree listing truncated for %s/%s", self.owner, self.repo)
             self._paths = [e["path"] for e in tree.get("tree", []) if e.get("type") == "blob"]
@@ -205,15 +217,17 @@ class GitHubRepo:
     ) -> str:
         validated_path = _validate_repo_path(path)
         encoded_path = _encode_repo_path(validated_path)
-        encoded_base = _validate_branch(self.base_branch)
         _validate_branch(branch)
+        if len(new_content) > MAX_FILE_CHARS:
+            raise ValueError(f"Proposed content for '{validated_path}' exceeds {MAX_FILE_CHARS} characters")
+        if validated_path not in self._read_blobs:
+            raise ValueError(f"Refusing to modify '{validated_path}' because it was not read first")
 
-        base_sha = self._request("GET", f"/git/ref/heads/{encoded_base}")["object"]["sha"]
+        base_sha = self._get_branch_sha(self.base_branch)
         existing_content, blob_sha = self._read_contents(validated_path, base_sha)
         if len(existing_content) > MAX_FILE_CHARS:
             raise ValueError(f"File '{validated_path}' exceeds {MAX_FILE_CHARS} characters")
-        observed_sha = self._read_blobs.get(validated_path)
-        if observed_sha is not None and observed_sha != blob_sha:
+        if self._read_blobs[validated_path] != blob_sha:
             raise RuntimeError(f"File '{validated_path}' changed on '{self.base_branch}' since it was read")
         if new_content == existing_content:
             raise ValueError(f"Proposed content for '{validated_path}' makes no changes")
@@ -299,17 +313,14 @@ class AntigravityRemediationAgent:
 
     @property
     def api_key(self) -> str | None:
-        return self._explicit_api_key or os.getenv("GEMINI_API_KEY")
+        raw = self._explicit_api_key or os.getenv("GEMINI_API_KEY", "")
+        stripped = raw.strip()
+        return stripped or None
 
     async def propose_fix(self, gh: GitHubRepo, request: RemediationRequest) -> dict[str, Any]:
-        env_dir = os.getenv("ANTIGRAVITY_APP_DATA_DIR")
-        dir_ctx = (
-            contextlib.nullcontext(env_dir)
-            if env_dir
-            else tempfile.TemporaryDirectory(prefix="antigravity_remediation_")
-        )
+        base_dir = os.getenv("ANTIGRAVITY_APP_DATA_DIR") or None
         timeout = float(os.getenv("REMEDIATION_AGENT_TIMEOUT_SECONDS", str(DEFAULT_AGENT_TIMEOUT_SECONDS)))
-        with dir_ctx as app_data_dir:
+        with tempfile.TemporaryDirectory(prefix="antigravity_remediation_", dir=base_dir) as app_data_dir:
             config = LocalAgentConfig(
                 system_instructions=(
                     "You are a Remediation Agent. A canary deployment was rejected because of a bug in the "
@@ -378,11 +389,12 @@ class RemediationService:
             gh = self.repo_factory(request.repoUrl, token, request.baseBranch or "main")
             if request.issueCategory == "OPERATIONAL":
                 title = f"Operational issue: {' '.join(request.title.split())[:80]}"
+                safe_diag = request.diagnosticContext[:2000].replace("```", "`\u200b``")
                 body = (
                     f"Operational issue detected by canary analysis.\n\n"
                     f"**Root cause**\n{request.rootCause}\n\n"
                     f"**Analysis**\n{request.analysis}\n\n"
-                    f"**Diagnostic context**\n```\n{request.diagnosticContext[:2000]}\n```"
+                    f"**Diagnostic context**\n```\n{safe_diag}\n```"
                 )
                 issue_url = await asyncio.to_thread(gh.create_issue, title, body)
                 return RemediationResponse(
@@ -391,16 +403,17 @@ class RemediationService:
                     message="Operational issue recorded on GitHub",
                 )
 
-            if not (self.agent.api_key or os.getenv("GEMINI_API_KEY")):
+            if not self.agent.api_key:
                 return RemediationResponse(
                     status="infra_error",
                     message="GEMINI_API_KEY is not configured",
                 )
 
             fix = await self.agent.propose_fix(gh, request)
-            path = fix.get("path")
+            raw_path = fix.get("path")
             new_content = fix.get("newContent")
-            if not isinstance(path, str) or not path or not isinstance(new_content, str) or not new_content:
+            path = raw_path.strip() if isinstance(raw_path, str) else ""
+            if not path or not isinstance(new_content, str) or not new_content:
                 title = f"Canary failure: {' '.join(request.title.split())[:80]}"
                 body = (
                     f"Automated remediation could not produce a confident code patch.\n\n"
@@ -466,13 +479,22 @@ class RemediationService:
 class A2ATaskStore:
     """In-memory bounded store for A2A 1.0 tasks."""
 
-    def __init__(self, max_tasks: int = MAX_STORED_TASKS, max_concurrent: int = MAX_CONCURRENT_TASKS):
+    def __init__(
+        self,
+        max_tasks: int = MAX_STORED_TASKS,
+        max_active: int = MAX_ACTIVE_TASKS,
+        max_concurrent: int = MAX_CONCURRENT_TASKS,
+    ):
         self.max_tasks = max_tasks
+        self.max_active = max_active
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self._tasks: dict[str, dict[str, Any]] = {}
         self._background: set[asyncio.Task[Any]] = set()
 
     def create(self, context_id: str | None = None) -> str | None:
+        active_count = sum(1 for t in self._tasks.values() if t["status"]["state"] not in _TERMINAL_STATES)
+        if active_count >= self.max_active:
+            return None
         if len(self._tasks) >= self.max_tasks:
             terminal_id = next(
                 (tid for tid, t in self._tasks.items() if t["status"]["state"] in _TERMINAL_STATES),
@@ -582,7 +604,10 @@ def register_remediation_routes(
     store = task_store or A2ATaskStore()
 
     @app.get("/.well-known/agent-card.json")
-    def agent_card():
+    def agent_card(http_request: Request):
+        public_url = os.getenv("REMEDIATION_PUBLIC_URL", "").strip() or (
+            str(http_request.base_url).rstrip("/") + "/"
+        )
         return {
             "name": "Antigravity Remediation Agent",
             "description": (
@@ -591,7 +616,13 @@ def register_remediation_routes(
             ),
             "version": "1.0.0",
             "supportedInterfaces": [
-                {"protocolBinding": "JSONRPC", "protocolVersion": "1.0", "url": "/"},
+                {"protocolBinding": "JSONRPC", "protocolVersion": "1.0", "url": public_url},
+            ],
+            "securitySchemes": {
+                "bearerAuth": {"type": "http", "scheme": "bearer"},
+            },
+            "securityRequirements": [
+                {"schemes": {"bearerAuth": []}},
             ],
             "capabilities": {"streaming": False, "pushNotifications": False},
             "skills": [
@@ -612,17 +643,21 @@ def register_remediation_routes(
     @app.post("/")
     async def a2a_jsonrpc(http_request: Request):
         if not _is_authorized(http_request):
-            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Unauthorized"},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
 
         try:
             payload = await http_request.json()
         except Exception:
             return _rpc_error(None, -32700, "Parse error")
-        if not isinstance(payload, dict) or payload.get("jsonrpc") != "2.0":
+        if not isinstance(payload, dict) or payload.get("jsonrpc") != "2.0" or not isinstance(payload.get("method"), str):
             return _rpc_error(payload.get("id") if isinstance(payload, dict) else None, -32600, "Invalid Request")
 
         req_id = payload.get("id")
-        method = payload.get("method")
+        method = payload["method"]
         params = payload.get("params")
         if params is None:
             params = {}
@@ -661,7 +696,7 @@ def register_remediation_routes(
             task = store.get(task_id)
             if task is None:
                 return _rpc_error(req_id, -32001, f"Task not found: {task_id}")
-            return {"jsonrpc": "2.0", "id": req_id, "result": {"task": task}}
+            return {"jsonrpc": "2.0", "id": req_id, "result": task}
 
         return _rpc_error(req_id, -32601, f"Method not found: {method}")
 
