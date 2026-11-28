@@ -37,6 +37,9 @@ class SpecialistRequest(BaseModel):
 async def lifespan(app):
     yield
     await remediation.shutdown()
+    store = getattr(app.state, "remediation_task_store", None)
+    if store is not None:
+        await store.shutdown()
 
 
 def create_app(role: str = "orchestrator") -> FastAPI:
@@ -107,7 +110,7 @@ def create_app(role: str = "orchestrator") -> FastAPI:
     elif role == "remediation":
         from agents.remediation_server import register_remediation_routes
 
-        register_remediation_routes(app)
+        app.state.remediation_task_store = register_remediation_routes(app)
     else:
         raise ValueError(f"Unknown role: {role}")
     return app
