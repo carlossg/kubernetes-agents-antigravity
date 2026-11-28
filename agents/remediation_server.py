@@ -137,7 +137,7 @@ def extract_json(text: str) -> dict[str, Any]:
 
     for fenced in re.findall(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL):
         _scan(fenced)
-    if not candidates:
+    if not any("path" in obj for obj in candidates):
         _scan(text)
     for obj in candidates:
         if "path" in obj:
@@ -504,7 +504,7 @@ class RemediationService:
             logger.exception("Remediation failed")
             return RemediationResponse(
                 status="agent_error",
-                message=str(exc),
+                message=str(exc) or type(exc).__name__,
             )
         finally:
             if gh is not None and hasattr(gh, "aclose"):
@@ -640,6 +640,10 @@ def _is_authorized(http_request: Request) -> bool:
     return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Invalid JSON constant: {value}")
+
+
 def register_remediation_routes(
     app: FastAPI,
     service: RemediationService | None = None,
@@ -710,7 +714,7 @@ def register_remediation_routes(
                 return JSONResponse(status_code=413, content={"error": "Request entity too large"})
 
         try:
-            payload = json.loads(bytes(body_buf))
+            payload = json.loads(bytes(body_buf), parse_constant=_reject_json_constant)
         except Exception:
             return _rpc_error(None, -32700, "Parse error")
         req_id = payload.get("id") if isinstance(payload, dict) else None
@@ -751,7 +755,7 @@ def register_remediation_routes(
                     store.complete(task_id, response)
                 except Exception as exc:
                     logger.exception("Unhandled error in remediation task %s", task_id)
-                    store.fail(task_id, str(exc))
+                    store.fail(task_id, str(exc) or type(exc).__name__)
 
             store.track(asyncio.create_task(_run()))
             return {"jsonrpc": "2.0", "id": req_id, "result": {"task": store.get(task_id)}}

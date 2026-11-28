@@ -64,6 +64,10 @@ class RepoHelpersTests(unittest.TestCase):
         self.assertEqual(extract_json(raw), {"path": "src/App.java", "newContent": "class App {}"})
         raw_unfenced = 'MetricsResource {} threw NPE; fix: {"path": "src/Metrics.java", "newContent": "ok"}'
         self.assertEqual(extract_json(raw_unfenced), {"path": "src/Metrics.java", "newContent": "ok"})
+        raw_preceding_fence = '```json\n{"status": 500}\n```\nFinal:\n{"path": "src/A.java", "newContent": "ok"}'
+        self.assertEqual(extract_json(raw_preceding_fence), {"path": "src/A.java", "newContent": "ok"})
+        raw_inner_ticks = '```json\n{"path": "README.md", "newContent": "```\\n{}\\n```"}\n```'
+        self.assertEqual(extract_json(raw_inner_ticks), {"path": "README.md", "newContent": "```\n{}\n```"})
         with self.assertRaises(ValueError):
             extract_json("no json here")
 
@@ -327,9 +331,10 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp2.status, "pr_failed")
         self.assertIsNone(resp2.issueLink)
 
-        fake_agent.propose_fix = AsyncMock(side_effect=TimeoutError("timed out"))
+        fake_agent.propose_fix = AsyncMock(side_effect=TimeoutError())
         resp3 = await svc.remediate(_sample_request("CODE_BUG"))
         self.assertEqual(resp3.status, "agent_error")
+        self.assertEqual(resp3.message, "TimeoutError")
 
     async def test_task_store_eviction_and_shutdown(self):
         store = A2ATaskStore(max_tasks=1, max_active=1)
@@ -405,6 +410,7 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
                 auth_headers = {"Authorization": "Bearer secret-token"}
                 for body, expected_code in (
                     ("{not-json", -32700),
+                    ('{"jsonrpc": "2.0", "id": NaN, "method": "GetTask", "params": {"id": "x"}}', -32700),
                     (json.dumps({"jsonrpc": "2.0", "id": "2"}), -32600),
                     (json.dumps({"jsonrpc": "2.0", "id": True, "method": "GetTask", "params": {}}), -32600),
                     (json.dumps({"jsonrpc": "2.0", "id": "3", "method": "Unknown", "params": {}}), -32601),
@@ -417,6 +423,13 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
 
                 oversized = await client.post("/", headers=auth_headers, content="x" * 1_100_000)
                 self.assertEqual(oversized.status_code, 413)
+
+                async def streamed_chunks():
+                    for _ in range(11):
+                        yield b"x" * 100_000
+
+                streamed_oversized = await client.post("/", headers=auth_headers, content=streamed_chunks())
+                self.assertEqual(streamed_oversized.status_code, 413)
 
                 real_sleep = asyncio.sleep
 
@@ -459,9 +472,14 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
         finally:
             await store.shutdown()
 
-    def test_create_app_wires_remediation_store(self):
+    async def test_create_app_wires_remediation_store_and_shutdown(self):
         app = create_app("remediation")
-        self.assertIsNotNone(getattr(app.state, "remediation_task_store", None))
+        store = getattr(app.state, "remediation_task_store", None)
+        self.assertIsNotNone(store)
+        with patch.object(store, "shutdown", new_callable=AsyncMock) as mock_shutdown:
+            async with app.router.lifespan_context(app):
+                pass
+            mock_shutdown.assert_awaited_once()
 
 
 if __name__ == "__main__":
