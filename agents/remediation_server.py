@@ -126,14 +126,18 @@ def extract_json(text: str) -> dict[str, Any]:
     decoder = json.JSONDecoder()
 
     def _scan(chunk: str) -> None:
-        for idx, ch in enumerate(chunk):
-            if ch == "{":
-                try:
-                    obj, _ = decoder.raw_decode(chunk, idx)
-                    if isinstance(obj, dict):
-                        candidates.append(obj)
-                except json.JSONDecodeError:
-                    continue
+        idx = 0
+        while idx < len(chunk):
+            pos = chunk.find("{", idx)
+            if pos == -1:
+                break
+            try:
+                obj, end = decoder.raw_decode(chunk, pos)
+                if isinstance(obj, dict):
+                    candidates.append(obj)
+                idx = end
+            except json.JSONDecodeError:
+                idx = pos + 1
 
     for fenced in re.findall(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL):
         _scan(fenced)
@@ -279,10 +283,12 @@ class GitHubRepo:
                 json={"title": title, "head": branch, "base": self.base_branch, "body": body},
             )
             return pr["html_url"]
-        except Exception:
+        except BaseException:
             try:
-                await self._request("DELETE", f"/git/refs/heads/{_validate_branch(branch)}")
-            except Exception:
+                await asyncio.shield(
+                    self._request("DELETE", f"/git/refs/heads/{_validate_branch(branch)}")
+                )
+            except BaseException:
                 logger.warning("Failed to delete orphaned branch %s", branch, exc_info=True)
             raise
 
@@ -498,7 +504,7 @@ class RemediationService:
                 return RemediationResponse(
                     status="pr_failed",
                     issueLink=issue_url,
-                    message=str(exc),
+                    message=str(exc) or type(exc).__name__,
                 )
         except Exception as exc:
             logger.exception("Remediation failed")
