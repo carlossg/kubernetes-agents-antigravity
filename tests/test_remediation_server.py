@@ -18,6 +18,7 @@ from agents.remediation_server import (
     MAX_FILE_CHARS,
     RemediationService,
     _make_tools,
+    _validate_branch,
     extract_json,
     is_repo_allowed,
     parse_repo_url,
@@ -68,6 +69,11 @@ class RepoHelpersTests(unittest.TestCase):
         self.assertEqual(extract_json(raw_preceding_fence), {"path": "src/A.java", "newContent": "ok"})
         raw_inner_ticks = '```json\n{"path": "README.md", "newContent": "```\\n{}\\n```"}\n```'
         self.assertEqual(extract_json(raw_inner_ticks), {"path": "README.md", "newContent": "```\n{}\n```"})
+        raw_log_path = 'Log: {"status": 500, "path": "/api/metrics"}\nFix: {"path": "src/M.java", "newContent": "ok"}'
+        self.assertEqual(extract_json(raw_log_path), {"path": "src/M.java", "newContent": "ok"})
+        for bad_branch in ("", "-main", "main.lock", "a..b", "a/./b", "/main"):
+            with self.assertRaises(ValueError):
+                _validate_branch(bad_branch)
         with self.assertRaises(ValueError):
             extract_json("no json here")
 
@@ -220,6 +226,12 @@ class AntigravityAgentTests(unittest.IsolatedAsyncioTestCase):
             agent = AntigravityRemediationAgent(model="gemini-4-neon", api_key="test-key")
             with self.assertRaises(TimeoutError):
                 await agent.propose_fix(fake_gh, _sample_request())
+        for bad_timeout in ("0", "-5", "NaN"):
+            with patch.dict(os.environ, {"REMEDIATION_AGENT_TIMEOUT_SECONDS": bad_timeout}, clear=True):
+                with self.assertRaises(ValueError):
+                    await AntigravityRemediationAgent(model="gemini-4-neon", api_key="test-key").propose_fix(
+                        fake_gh, _sample_request(),
+                    )
 
     async def test_tools_handle_errors_and_oversized_files(self):
         fake_gh = MagicMock(spec=GitHubRepo)
@@ -411,6 +423,7 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
                 for body, expected_code in (
                     ("{not-json", -32700),
                     ('{"jsonrpc": "2.0", "id": NaN, "method": "GetTask", "params": {"id": "x"}}', -32700),
+                    ('{"jsonrpc": "2.0", "id": 1e309, "method": "GetTask", "params": {"id": "x"}}', -32600),
                     (json.dumps({"jsonrpc": "2.0", "id": "2"}), -32600),
                     (json.dumps({"jsonrpc": "2.0", "id": True, "method": "GetTask", "params": {}}), -32600),
                     (json.dumps({"jsonrpc": "2.0", "id": "3", "method": "Unknown", "params": {}}), -32601),
@@ -420,6 +433,12 @@ class RemediationServiceAndA2ATests(unittest.IsolatedAsyncioTestCase):
                 ):
                     resp = await client.post("/", headers=auth_headers, content=body)
                     self.assertEqual(resp.json()["error"]["code"], expected_code)
+
+                data_part_resp = await client.post("/", headers=auth_headers, json={
+                    "jsonrpc": "2.0", "id": "7", "method": "SendMessage",
+                    "params": {"message": {"parts": [{"data": _sample_request().model_dump()}]}},
+                })
+                self.assertIn("task", data_part_resp.json()["result"])
 
                 oversized = await client.post("/", headers=auth_headers, content="x" * 1_100_000)
                 self.assertEqual(oversized.status_code, 413)

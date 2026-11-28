@@ -141,9 +141,12 @@ def extract_json(text: str) -> dict[str, Any]:
 
     for fenced in re.findall(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL):
         _scan(fenced)
-    if not any("path" in obj for obj in candidates):
+    if not any("path" in obj and "newContent" in obj for obj in candidates):
         _scan(text)
     for obj in candidates:
+        if "path" in obj and "newContent" in obj:
+            return obj
+    for obj in reversed(candidates):
         if "path" in obj:
             return obj
     if candidates:
@@ -285,9 +288,8 @@ class GitHubRepo:
             return pr["html_url"]
         except BaseException:
             try:
-                await asyncio.shield(
-                    self._request("DELETE", f"/git/refs/heads/{_validate_branch(branch)}")
-                )
+                async with asyncio.timeout(10):
+                    await self._request("DELETE", f"/git/refs/heads/{_validate_branch(branch)}")
             except BaseException:
                 logger.warning("Failed to delete orphaned branch %s", branch, exc_info=True)
             raise
@@ -610,13 +612,16 @@ class A2ATaskStore:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def _extract_request_text(params: dict[str, Any]) -> str:
+def _parse_remediation_request(params: dict[str, Any]) -> RemediationRequest:
     message = params.get("message")
     if not isinstance(message, dict):
         raise ValueError("Missing params.message")
     parts = message.get("parts")
     if not isinstance(parts, list):
         raise ValueError("Missing params.message.parts")
+    for p in parts:
+        if isinstance(p, dict) and isinstance(p.get("data"), dict):
+            return RemediationRequest.model_validate(p["data"])
     text = "".join(
         p.get("text", "")
         for p in parts
@@ -624,7 +629,7 @@ def _extract_request_text(params: dict[str, Any]) -> str:
     ).strip()
     if not text:
         raise ValueError("Empty remediation request message")
-    return text
+    return RemediationRequest.model_validate_json(text)
 
 
 def _rpc_error(request_id: Any, code: int, message: str) -> JSONResponse:
@@ -724,7 +729,10 @@ def register_remediation_routes(
         except Exception:
             return _rpc_error(None, -32700, "Parse error")
         req_id = payload.get("id") if isinstance(payload, dict) else None
-        valid_id = not isinstance(req_id, bool) and isinstance(req_id, (str, int, float, type(None)))
+        valid_id = not isinstance(req_id, bool) and (
+            isinstance(req_id, (str, int, type(None)))
+            or (isinstance(req_id, float) and math.isfinite(req_id))
+        )
         if (
             not isinstance(payload, dict)
             or payload.get("jsonrpc") != "2.0"
@@ -742,8 +750,7 @@ def register_remediation_routes(
 
         if method == "SendMessage":
             try:
-                raw_text = _extract_request_text(params)
-                remediation_req = RemediationRequest.model_validate_json(raw_text)
+                remediation_req = _parse_remediation_request(params)
             except (ValueError, ValidationError) as exc:
                 return _rpc_error(req_id, -32602, f"Invalid RemediationRequest: {exc}")
 
